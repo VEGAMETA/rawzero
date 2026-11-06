@@ -25,7 +25,8 @@ pub mod ints {
     pub const CROP_W: usize = 11;
     pub const CROP_H: usize = 12;
     pub const MIRROR: usize = 13; // 0 none, 1 reverse columns, 2 reverse rows (stored pixels)
-    pub const LEN: usize = 14;
+    pub const MODE: usize = 14; // 0 Process Zero, 1 Classic (noise reduction + tone match)
+    pub const LEN: usize = 15;
 }
 
 /// `floats` layout: black level [0..4] (2x2 CFA, row-major), white level [4],
@@ -215,7 +216,11 @@ pub extern "system" fn Java_dev_vegameta_rawzero_Native_processRaw16<'caller>(
                 }
                 Some(rawzero_core::Rgb8Image { width: rw, height: rh, data: v.into_iter().map(|b| b as u8).collect() })
             };
-            let look = reference.as_ref().map_or(rawzero_core::Look::Fixed, rawzero_core::Look::MatchReference);
+            let look = if read_ints(env, &ints_arr)?[ints::MODE] == 1 {
+                rawzero_core::Look::Classic(reference.as_ref())
+            } else {
+                rawzero_core::Look::Fixed
+            };
             let (img, _t) = rawzero_core::process_look(&raw, &meta, look)?;
             let img = match read_ints(env, &ints_arr)?[ints::MIRROR] {
                 1 => rawzero_core::image::mirror(&img, rawzero_core::image::Mirror::Columns),

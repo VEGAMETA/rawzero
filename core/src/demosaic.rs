@@ -72,19 +72,20 @@ pub fn demosaic_mhc(m: &Mosaic, cfa: CfaPattern) -> RgbImage {
     let p = pad_reflect(m);
     let pw = w + 2 * PAD;
     let ops = ops_for(cfa);
-    let mut data = Vec::with_capacity(w * h);
-    for y in 0..h {
-        for x in 0..w {
+    // Rows are independent: parallel over rows, identical output for any thread count.
+    use rayon::prelude::*;
+    let mut data = vec![[0.0f32; 3]; w * h];
+    data.par_chunks_mut(w).enumerate().for_each(|(y, out)| {
+        for (x, px) in out.iter_mut().enumerate() {
             let center = (y + PAD) * pw + x + PAD;
             let at = |dy: isize, dx: isize| p[(center as isize + dy * pw as isize + dx) as usize];
             let op = &ops[cell(x, y)];
-            let px: [f32; 3] = std::array::from_fn(|c| match op[c] {
+            *px = std::array::from_fn(|c| match op[c] {
                 Op::Copy => at(0, 0),
                 Op::Kernel(k) => k.iter().map(|&(dy, dx, wt)| wt * at(dy, dx)).sum::<f32>() * 0.125,
             });
-            data.push(px);
         }
-    }
+    });
     debug_assert_eq!([R, G, B], [0, 1, 2]);
     RgbImage { width: w, height: h, data }
 }

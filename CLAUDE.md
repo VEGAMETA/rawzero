@@ -11,7 +11,8 @@ An Android camera for two people (Xiaomi 14 primary, Samsung S21 Ultra as test/r
 Three modes (owner decision, 2026-11-06):
 1. **Classic** (default, main focus). Single frame. A classical in-camera JPEG engine: noise reduction driven by the sensor noise profile (strong on chroma, gentle on luma), mild sharpening, global tone curve plus gentle single-frame shadow/highlight compression. Global look (exposure, white balance, contrast, saturation) matched to the ISP preview the user saw.
 2. **Process Zero**. Single frame, minimal pipeline: levels → shading → WB → demosaic → color → fixed global curve. No NR, no sharpening, no local operators; grain stays.
-3. **Night**. Burst of RAW frames, aligned and merged with a classical, non-ML method (HDR+-style, Hasinoff et al. 2016), then the Classic engine. Only on explicit user choice.
+3. **Night**. Burst of RAW frames, aligned and merged with a classical, non-ML method (HDR+-style, Hasinoff et al. 2016), then the Classic engine. Only on explicit user choice. (Not implemented yet: currently one Classic frame.)
+4. **Screen** ("Экран"). The ISP's own JPEG of the same request, saved as is (front mirrored like the preview): exactly what the screen showed, for when the user wants the phone's look.
 
 Requirements:
 - Auto exposure and autofocus like a normal camera. The user never has to set anything manually.
@@ -83,10 +84,10 @@ Strictly in this order; each step is a separate function with a test:
 9. **Encode:** JPEG (quality ~92) or HEIC, with EXIF and orientation. Optional DNG via `DngCreator` into `Pictures/RawZero/DNG/`.
 
 Classic adds, each a separate pure function with a test, all parameters derived from metadata (noise profile, ISO), never from image content classification:
-- **Noise reduction** after color conversion, in an opponent space (luma + 2 chroma), strength from `SENSOR_NOISE_PROFILE` / DNG `NoiseProfile`.
+- **Noise reduction** (`core/src/denoise.rs`) in the raw domain, after levels and before shading/WB/demosaic: each Bayer cell -> Y, Cr, Cb, Gd; Poisson-Gaussian model fitted blindly from Gd (no reliance on HAL noise profiles); Y by 8x8 Walsh-Hadamard hard threshold + empirical Wiener, stride 2, Kaiser aggregation; chroma by a guided filter on the denoised Y; `LUMA_GRAIN_KEEP` of the grain kept. Parallel (rayon) with fixed-order accumulation, so output hashes do not depend on thread count.
 - **Sharpening**: mild luma-only unsharp mask, amount scaled down with noise.
 - **Local tone**: edge-aware base/detail split of log luminance (guided filter), gentle base compression; no halos (verified on edges, `tools/`).
-- **Look match**: at capture the ISP JPEG/YUV of the same request is kept as a reference; a global tone curve and 3x3 color correction are fitted from our linear render to it, so exposure, WB and saturation match what the user saw. Only global, low-parameter mappings; detail comes from our pipeline.
+- **Look match** (`core/src/look.rs`): the ISP JPEG of the same request (else the preview frame at the shutter) is the reference; global WB gains (mid-tone mean color) and a monotone tone curve (luminance histogram specification) are fitted from our linear render to it, so exposure, WB and contrast match what the user saw. Distribution-based (no registration), global, low-parameter; detail and noise handling are ours. Saturation is not matched yet.
 
 Process Zero forbids all of the above.
 

@@ -5,7 +5,9 @@
     <uses-feature android:name="android.hardware.camera.any" android:required="true" />
 
     <application
-        android:label="RawZero"
+        android:label="${appLabel}"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
         android:forceDarkAllowed="false"
         android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
         <activity

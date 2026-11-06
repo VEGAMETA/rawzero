@@ -58,11 +58,18 @@ class LensOptions(val lens: Lens) {
     val exposures: List<Long?> = listOf<Long?>(null) + listOf(
         1.0 / 8000, 1.0 / 4000, 1.0 / 2000, 1.0 / 1000, 1.0 / 500, 1.0 / 250, 1.0 / 125, 1.0 / 60,
         1.0 / 30, 1.0 / 15, 1.0 / 8, 1.0 / 4, 1.0 / 2, 1.0, 2.0, 4.0, 8.0, 10.0, 15.0, 20.0, 30.0, 45.0, 60.0,
-    ).map { (it * 1e9).toLong() }.filter { it in expMin..expMax }
+    ).map { (it * 1e9).toLong() }.filter { it in expMin..expMax }.let { l ->
+        // The sensor's own limit if it falls between stops (Xiaomi front: 0.41 s).
+        if (l.isNotEmpty() && expMax > l.last() * 1.15) l + expMax else l
+    }
 
     private val isoRange = ch[CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE]
     val isos: List<Int?> = listOf<Int?>(null) + listOf(50, 100, 200, 400, 800, 1600, 3200, 6400, 12800)
-        .filter { isoRange == null || it in isoRange.lower..isoRange.upper }
+        .filter { isoRange == null || it in isoRange.lower..isoRange.upper }.let { l ->
+            // The sensor's top ISO if it falls between stops (Xiaomi W: 3188).
+            val top = isoRange?.upper
+            if (top != null && l.isNotEmpty() && top > l.last() * 1.15) l + top else l
+        }
 
     /** Closest focus in diopters; 0 means fixed focus (front cameras). */
     val minFocus: Float = ch[CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE] ?: 0f

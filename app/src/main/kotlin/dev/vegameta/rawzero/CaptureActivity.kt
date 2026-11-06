@@ -62,7 +62,12 @@ private const val PREF_DEV = "save_dev_pairs"
 /// Exposures from this length on get the ring + countdown indicator.
 private const val LONG_EXPOSURE_UI_NS = 500_000_000L
 
-enum class Mode(val title: String) { NIGHT("Ночь"), CLASSIC("Классика"), RAW("RAW") }
+/**
+ * NIGHT: burst merge (not implemented yet: single Classic frame). CLASSIC: our pipeline with
+ * raw noise reduction and tone/WB matched to the preview. RAW: Process Zero + DNG.
+ * SCREEN: exactly what the screen showed - the ISP's own JPEG of the shot.
+ */
+enum class Mode(val title: String) { NIGHT("Ночь"), CLASSIC("Классика"), RAW("RAW"), SCREEN("Экран") }
 
 /**
  * Camera screen: ISP preview, lens bar, modes, manual controls (all auto by default),
@@ -119,6 +124,8 @@ class CaptureActivity : Activity(), SurfaceHolder.Callback {
             discover()
         }
         loadLastThumbnail()
+        // Testing: `--es mode CLASSIC|NIGHT|RAW|SCREEN`.
+        intent.getStringExtra("mode")?.let { runCatching { mode = Mode.valueOf(it); refreshModes() } }
     }
 
     override fun onRequestPermissionsResult(code: Int, perms: Array<out String>, results: IntArray) {
@@ -227,6 +234,7 @@ class CaptureActivity : Activity(), SurfaceHolder.Callback {
     private fun buildPanel(lens: Lens) {
         panel.removeAllViews()
         val o = LensOptions(lens)
+        Log.i(TAG, "options ${lens.key}: shutter up to ${o.exposures.lastOrNull()?.let(::formatExposure)}, ISO up to ${o.isos.lastOrNull()}")
         fun row(label: String, count: Int, initial: Int, fmt: (Int) -> String, set: (Int) -> Unit) {
             val value = TextView(this).apply { setTextColor(Color.WHITE); textSize = 13f; text = fmt(initial) }
             val head = LinearLayout(this).apply {
@@ -322,6 +330,10 @@ class CaptureActivity : Activity(), SurfaceHolder.Callback {
             }
             // `adb shell am start ... --es lens <id>` preselects a lens (testing).
             val wanted = intent.getStringExtra("lens")?.let { id -> lenses.firstOrNull { it.id == id || it.key == id } }
+            if (android.os.Build.MANUFACTURER.equals("samsung", ignoreCase = true) && packageName == "dev.vegameta.rawzero") {
+                // Samsung shows its telephotos only to allow-listed package names.
+                status.text = "на Samsung установите «RawZero S», чтобы открылись телевики"
+            }
             if (lenses.isEmpty()) status.text = "камер не найдено"
             else select(wanted ?: lenses.firstOrNull { !it.front && it.eqMm in 20..30 } ?: lenses.first())
             // Test presets after the lens is chosen: --el exp <ns> --ei iso <n> --ei kelvin <K> --ei ev <steps>.
@@ -452,9 +464,17 @@ class CaptureActivity : Activity(), SurfaceHolder.Callback {
     private fun process(shot: Shot, m: Mode): Triple<String, Uri, Bitmap?> {
         val name = ShotSaver.baseName(shot)
         val raw = shot.raw
+        if (m == Mode.SCREEN && shot.ispJpeg != null) {
+            // "As on screen": the ISP rendering, mirrored for the front lens like the preview.
+            val jpeg = if (shot.lens.front) mirrorJpeg(shot.ispJpeg, shot.jpegOrientation) else shot.ispJpeg
+            val uri = ShotSaver.saveJpeg(contentResolver, ShotSaver.DIR, name, jpeg)
+            Log.i(TAG, "saved $name SCREEN ${ShotSaver.summary(shot.result)}")
+            return Triple("${shot.lens.label}  ${ShotSaver.summary(shot.result)}  как на экране", uri, thumbnail(jpeg, shot.jpegOrientation))
+        }
         if (raw == null) {
             // ISP-only lens (no RAW in the HAL): keep the phone's own JPEG rather than nothing.
-            val jpeg = requireNotNull(shot.ispJpeg) { "lens ${shot.lens.key} delivered nothing" }
+            val isp = requireNotNull(shot.ispJpeg) { "lens ${shot.lens.key} delivered nothing" }
+            val jpeg = if (shot.lens.front) mirrorJpeg(isp, shot.jpegOrientation) else isp
             val uri = ShotSaver.saveJpeg(contentResolver, ShotSaver.DIR, name, jpeg)
             Log.i(TAG, "saved $name ISP-only ${ShotSaver.summary(shot.result)}")
             return Triple("${shot.lens.label}  ${ShotSaver.summary(shot.result)}  без RAW", uri, thumbnail(jpeg, shot.jpegOrientation))
@@ -469,7 +489,8 @@ class CaptureActivity : Activity(), SurfaceHolder.Callback {
             shot.ispJpeg != null -> Native.referenceRgb(shot.ispJpeg)
             else -> shutterFrame?.let(Native::referenceRgb)
         }
-        val jpeg = Native.process(raw, shot.lens.chars, shot.result, ShotSaver.exifOrientation(shot.jpegOrientation), mirror, reference)
+        val jpeg = Native.process(raw, shot.lens.chars, shot.result, ShotSaver.exifOrientation(shot.jpegOrientation), mirror, reference,
+            classic = m != Mode.RAW)
         val ms = (System.nanoTime() - t0) / 1_000_000
         val uri = ShotSaver.saveJpeg(contentResolver, ShotSaver.DIR, name, jpeg)
         if (m == Mode.RAW) ShotSaver.saveDng(contentResolver, ShotSaver.DIR_DNG, name, shot)
@@ -479,6 +500,36 @@ class CaptureActivity : Activity(), SurfaceHolder.Callback {
         }
         Log.i(TAG, "saved $name mode $m pipeline ${ms}ms ${ShotSaver.summary(shot.result)}")
         return Triple("${shot.lens.label}  ${ShotSaver.summary(shot.result)}  $ms мс", uri, thumbnail(jpeg, shot.jpegOrientation))
+    }
+
+    /**
+     * Left-right flip of an ISP JPEG as displayed (selfie mirror). Decoded pixels are in
+     * sensor orientation (EXIF carries the rotation), so with 90/270 the displayed horizontal
+     * axis is the stored vertical one. Re-encoded at quality 95, EXIF orientation kept.
+     */
+    private fun mirrorJpeg(jpeg: ByteArray, degrees: Int): ByteArray {
+        val bmp = BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size) ?: return jpeg
+        val m = Matrix().apply { if (degrees % 180 == 0) postScale(-1f, 1f) else postScale(1f, -1f) }
+        val flipped = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, m, true)
+        val out = java.io.ByteArrayOutputStream(jpeg.size)
+        flipped.compress(Bitmap.CompressFormat.JPEG, 95, out)
+        bmp.recycle(); flipped.recycle()
+        val orientation = runCatching {
+            android.media.ExifInterface(java.io.ByteArrayInputStream(jpeg)).getAttribute(android.media.ExifInterface.TAG_ORIENTATION)
+        }.getOrNull()
+        val bytes = out.toByteArray()
+        if (orientation == null) return bytes
+        // Bitmap.compress writes no EXIF: carry the rotation over.
+        val tmp = java.io.File.createTempFile("mirror", ".jpg", cacheDir)
+        return try {
+            tmp.writeBytes(bytes)
+            android.media.ExifInterface(tmp.absolutePath).apply {
+                setAttribute(android.media.ExifInterface.TAG_ORIENTATION, orientation); saveAttributes()
+            }
+            tmp.readBytes()
+        } finally {
+            tmp.delete()
+        }
     }
 
     private fun thumbnail(jpeg: ByteArray, degrees: Int): Bitmap? {

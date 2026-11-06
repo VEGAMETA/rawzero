@@ -109,6 +109,47 @@ impl ToneMap {
     }
 }
 
+/// Global white-balance match: per-channel gains (green = 1) that bring the mean linear
+/// color of our mid-tones to the reference's mid-tones (the ISP's AWB preference, e.g. warmer
+/// skin). Mid-tones = luminance between the 20th and 90th percentile, unclipped. Two degrees
+/// of freedom, distribution-based like the tone fit, so no registration is needed.
+pub fn fit_wb(ours: &RgbImage, reference: &Rgb8Image) -> [f32; 3] {
+    let lut: Vec<f32> = (0..256).map(|i| srgb_eotf(i as f32 / 255.0)).collect();
+    let mean_mid = |px: &mut dyn Iterator<Item = [f32; 3]>| -> Option<[f64; 3]> {
+        let v: Vec<[f32; 3]> = px.filter(|p| p.iter().all(|&c| c > 0.0 && c < 0.97)).collect();
+        if v.len() < 1000 {
+            return None;
+        }
+        let mut l: Vec<f32> = v.iter().map(lum).collect();
+        l.sort_unstable_by(f32::total_cmp);
+        let (lo, hi) = (l[l.len() / 5], l[l.len() * 9 / 10]);
+        let mut s = [0.0f64; 3];
+        let mut n = 0usize;
+        for p in v.iter().filter(|p| (lo..=hi).contains(&lum(p))) {
+            for c in 0..3 {
+                s[c] += p[c] as f64;
+            }
+            n += 1;
+        }
+        (n > 0).then(|| s.map(|x| x / n as f64))
+    };
+    let step = (ours.data.len() / 300_000).max(1);
+    let a = mean_mid(&mut ours.data.iter().step_by(step).copied());
+    let rstep = (reference.data.len() / 3 / 300_000).max(1);
+    let b = mean_mid(&mut reference.data.chunks_exact(3).step_by(rstep).map(|p| [lut[p[0] as usize], lut[p[1] as usize], lut[p[2] as usize]]));
+    let (Some(a), Some(b)) = (a, b) else { return [1.0; 3] };
+    let g: [f64; 3] = std::array::from_fn(|c| (b[c] / b[1]) / (a[c] / a[1]));
+    // Guard against nonsense (wildly different scenes / failed captures).
+    if g.iter().any(|v| !(0.5..=2.0).contains(v)) {
+        return [1.0; 3];
+    }
+    g.map(|v| v as f32)
+}
+
+pub fn apply_gains(img: &RgbImage, g: [f32; 3]) -> RgbImage {
+    RgbImage { width: img.width, height: img.height, data: img.data.iter().map(|p| [p[0] * g[0], p[1] * g[1], p[2] * g[2]]).collect() }
+}
+
 #[inline]
 fn lum(p: &[f32; 3]) -> f32 {
     LUMA[0] * p[0] + LUMA[1] * p[1] + LUMA[2] * p[2]
@@ -200,6 +241,15 @@ mod tests {
         let px = RgbImage { width: 1, height: 1, data: vec![[0.3, 0.05, 0.05]] };
         let o = render_matched(&px, &tm).data;
         assert!(o[0] > o[1] && o[1] == o[2]);
+    }
+
+    #[test]
+    fn wb_match_recovers_a_cast() {
+        // Reference is our scene with a warm cast (R x1.3, B x0.8 in linear).
+        let ours = RgbImage { width: 2000, height: 1, data: (0..2000).map(|i| { let v = 0.05 + 0.4 * i as f32 / 2000.0; [v, v * 1.1, v * 0.9] }).collect() };
+        let reference = Rgb8Image { width: 2000, height: 1, data: ours.data.iter().flat_map(|p| [p[0] * 1.3, p[1], p[2] * 0.8].map(|c| (srgb_oetf(c) * 255.0 + 0.5) as u8)).collect() };
+        let g = fit_wb(&ours, &reference);
+        assert!((g[0] - 1.3).abs() < 0.03 && g[1] == 1.0 && (g[2] - 0.8).abs() < 0.03, "{g:?}");
     }
 
     #[test]

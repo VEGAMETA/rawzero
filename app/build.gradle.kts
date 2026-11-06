@@ -20,9 +20,11 @@ android {
     // a flavor cannot be installed while the real package with that name is present.
     flavorDimensions += "pkg"
     productFlavors {
-        create("rawzero") { dimension = "pkg" }
-        create("scan3d") { dimension = "pkg"; applicationId = "com.samsung.android.scan3d" }
-        create("ruler") { dimension = "pkg"; applicationId = "com.samsung.android.ruler" }
+        create("rawzero") { dimension = "pkg"; manifestPlaceholders["appLabel"] = "RawZero" }
+        // Samsung: the cameraserver shows the telephotos only to allow-listed packages.
+        // Also worth trying on other brands when lenses are missing.
+        create("scan3d") { dimension = "pkg"; applicationId = "com.samsung.android.scan3d"; manifestPlaceholders["appLabel"] = "RawZero S" }
+        create("ruler") { dimension = "pkg"; applicationId = "com.samsung.android.ruler"; manifestPlaceholders["appLabel"] = "RawZero R" }
     }
 
     buildTypes {

@@ -6,6 +6,7 @@
 
 pub mod color;
 pub mod demosaic;
+pub mod denoise;
 pub mod encode;
 pub mod hotpixel;
 pub mod image;
@@ -50,10 +51,11 @@ pub type Timings = Vec<(&'static str, Duration)>;
 /// How step 8 turns linear RGB into display values.
 #[derive(Clone, Copy, Debug)]
 pub enum Look<'a> {
-    /// Process Zero: fixed global S-curve, then sRGB OETF.
+    /// Process Zero: no noise reduction, fixed global S-curve, then sRGB OETF.
     Fixed,
-    /// Classic: global tone curve fitted to the ISP output of the same request (look.rs).
-    MatchReference(&'a Rgb8Image),
+    /// Classic: raw-domain noise reduction (denoise.rs) and a global tone curve fitted to
+    /// the ISP output of the same request (look.rs); fixed curve when no reference exists.
+    Classic(Option<&'a Rgb8Image>),
 }
 
 /// Steps 2..8 on an unpacked frame (Process Zero). Encoding is separate.
@@ -77,6 +79,13 @@ pub fn process_look(raw: &RawImage, meta: &FrameMeta, look: Look) -> Result<(Rgb
 
     let mut m = levels::apply_levels(raw, meta);
     lap("levels", &mut t);
+    // Noise reduction on stationary-noise data: after levels, before shading gains and WB.
+    if matches!(look, Look::Classic(_)) {
+        if let Some(nm) = denoise::estimate_noise(&m, meta.cfa) {
+            m = denoise::denoise_mosaic(&m, meta.cfa, nm);
+        }
+        lap("denoise", &mut t);
+    }
     if let Some(map) = &meta.lens_shading {
         m = shading::apply_lens_shading(&m, map, meta.cfa);
         lap("lens_shading", &mut t);
@@ -98,10 +107,11 @@ pub fn process_look(raw: &RawImage, meta: &FrameMeta, look: Look) -> Result<(Rgb
     let rgb = color::apply_matrix(&rgb, &cam_to_srgb);
     lap("color", &mut t);
     let out = match look {
-        Look::Fixed => tone::render_8bit(&rgb, &tone::build_lut()),
-        Look::MatchReference(r) => {
+        Look::Fixed | Look::Classic(None) => tone::render_8bit(&rgb, &tone::build_lut()),
+        Look::Classic(Some(r)) => {
+            let rgb = look::apply_gains(&rgb, look::fit_wb(&rgb, r));
             let tm = look::ToneMap::fit(&rgb, r);
-            lap("tone_fit", &mut t);
+            lap("look_fit", &mut t);
             look::render_matched(&rgb, &tm)
         }
     };

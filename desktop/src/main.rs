@@ -14,7 +14,8 @@ const USAGE: &str = "usage: rawzero <input.dng> [-o out.jpg] [-q quality] [--fix
   -q N               JPEG quality 1..100 (default 92)
   --fix-hot-pixels   run hot pixel suppression (DNG does not say whether the HAL did it)
   --no-shading       skip lens shading even if the DNG carries a GainMap
-  --ref ISP.jpg      Classic look: match the tone of this ISP JPEG of the same shot
+  --classic          Classic mode: raw noise reduction (+ tone match with --ref)
+  --ref ISP.jpg      Classic look: match the tone of this ISP JPEG of the same shot (implies --classic)
   --info             print metadata and exit";
 
 struct Args {
@@ -25,11 +26,12 @@ struct Args {
     no_shading: bool,
     info: bool,
     reference: Option<PathBuf>,
+    classic: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
     let mut it = std::env::args().skip(1);
-    let mut a = Args { input: PathBuf::new(), output: None, quality: DEFAULT_QUALITY, fix_hot: false, no_shading: false, info: false, reference: None };
+    let mut a = Args { input: PathBuf::new(), output: None, quality: DEFAULT_QUALITY, fix_hot: false, no_shading: false, info: false, reference: None, classic: false };
     let mut input = None;
     while let Some(s) = it.next() {
         match s.as_str() {
@@ -38,6 +40,7 @@ fn parse_args() -> Result<Args, String> {
             "--fix-hot-pixels" => a.fix_hot = true,
             "--no-shading" => a.no_shading = true,
             "--ref" => a.reference = Some(it.next().ok_or("--ref needs a path")?.into()),
+            "--classic" => a.classic = true,
             "--info" => a.info = true,
             "-h" | "--help" => return Err(USAGE.into()),
             _ if s.starts_with('-') => return Err(format!("unknown option {s}\n{USAGE}")),
@@ -87,7 +90,7 @@ fn run() -> Result<(), String> {
     }
 
     let reference = args.reference.as_deref().map(read_jpeg).transpose()?;
-    let look = reference.as_ref().map_or(rawzero_core::Look::Fixed, rawzero_core::Look::MatchReference);
+    let look = if args.classic || reference.is_some() { rawzero_core::Look::Classic(reference.as_ref()) } else { rawzero_core::Look::Fixed };
     let (img, timings) = rawzero_core::process_look(&d.raw, &d.meta, look).map_err(|e| e.to_string())?;
     let t1 = Instant::now();
     let jpeg = encode_jpeg(&img, args.quality, d.meta.orientation).map_err(|e| e.to_string())?;
