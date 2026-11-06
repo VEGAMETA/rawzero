@@ -24,7 +24,7 @@ Non-goals:
 
 | Device | Known facts |
 |---|---|
-| Xiaomi 14 (HyperOS 3, Android 16) | Open Camera (Camera2) sees only W and UW on the back; telephoto and front are hidden, presumably by the firmware allow-list (`vendor.camera.aux.packagelist`). 50 MP quad-Bayer sensor. Stock camera Pro-mode DNGs are **not** single frames: at ISO 3200 their shot-noise slope is ~120x below Open Camera's and the noise is spatially correlated (`tools/reports/raw_noise.md`). Open Camera RAW_SENSOR is clean: white noise, dynamic black level preserved with values below it. Its DNGs are lossless-JPEG compressed. |
+| Xiaomi 14 (HyperOS 3, Android 16) | `getCameraIdList()` returns only logical 0 (W+UW) and front 1; tele is hidden (reachable by direct ID, see below). No `vendor.camera.aux.packagelist` property on this firmware. 50 MP quad-Bayer sensor. Stock camera Pro-mode DNGs are **not** single frames: at ISO 3200 their shot-noise slope is ~120x below Open Camera's and the noise is spatially correlated (`tools/reports/raw_noise.md`). Open Camera RAW_SENSOR is clean: white noise, dynamic black level preserved with values below it. Its DNGs are lossless-JPEG compressed. |
 | Samsung S21 Ultra (One UI) | Open Camera sees only W and UW on the back; 3x/10x telephotos and front are hidden, `physicalCameraIds` is empty. HM3 sensor is nonacell (3×3). Stock Pro-mode DNGs (also from the 3x tele) have black level 0 with negatives clipped to 0, which biases shadows magenta; shading is pre-applied (identity 1x1 GainMap); main-camera noise is spatially correlated. |
 
 **Goal: every physical camera in RAW, single frame, no vendor processing.** Probe results (`app/` probe, `tools/camera_dump.py`, `tools/reports/raw_noise_probe.md`), 2026-11-06:
