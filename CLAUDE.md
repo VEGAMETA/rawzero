@@ -16,6 +16,8 @@ Three modes (owner decision, 2026-11-06):
 
 Zoom on any lens (pinch, double tap 1x/2x): CONTROL_ZOOM_RATIO (else SCALER_CROP_REGION) for preview and ISP JPEG; RAW streams are never cropped by Camera2, so the pipeline center-crops the RAW by the same ratio (even offsets), output at the honest crop resolution. Flash off / on capture / always, implemented with FLASH_MODE_TORCH (on capture: torch in the preview ~0.7 s so AE/AWB settle, then the still). Mode and lens are remembered.
 
+5. **Skrin** ("Скрин"). The viewfinder frame itself (PixelCopy of the preview SurfaceView at the preview stream's resolution, up to 1440x1920), saved as JPEG with the EXIF rotation of how the phone is held. The owner's "like a screenshot" look: the ISP still is over-sharpened with halos and, when zoomed, upscaled; the preview is not. No capture request is issued.
+
 One photo per shot: front lens mirrored like the preview, rear normal. DNG only in RAW mode; dev pairs (DNG + ISP JPEG) are an opt-in toggle. Verified WYSIWYG on Xiaomi 14: the saved photo shown in the gallery and the preview before the shutter differ by ~1/255 in mean RGB on screen.
 
 Requirements:

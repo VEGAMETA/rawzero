@@ -67,9 +67,11 @@ private const val LONG_EXPOSURE_UI_NS = 500_000_000L
 /**
  * NIGHT: burst merge (not implemented yet: single Classic frame). CLASSIC: our pipeline with
  * raw noise reduction and tone/WB matched to the preview. RAW: Process Zero + DNG.
- * SCREEN: exactly what the screen showed - the ISP's own JPEG of the shot.
+ * SCREEN: the ISP's full-resolution still recolored to the preview.
+ * SKRIN: the preview frame itself at full preview-stream resolution, like a screenshot of the
+ * viewfinder (the ISP still is over-sharpened and, when zoomed, upscaled; the preview is not).
  */
-enum class Mode(val title: String) { NIGHT("Ночь"), CLASSIC("Цифровой"), RAW("RAW"), SCREEN("Экран") }
+enum class Mode(val title: String) { NIGHT("Ночь"), CLASSIC("Цифровой"), RAW("RAW"), SCREEN("Экран"), SKRIN("Скрин") }
 
 /**
  * Camera screen: ISP preview, lens bar, modes, manual controls (all auto by default),
@@ -468,6 +470,10 @@ class CaptureActivity : Activity(), SurfaceHolder.Callback {
     private fun shoot() {
         val s = session ?: return
         if (busy) return
+        if (mode == Mode.SKRIN) {
+            shootPreviewFrame(s)
+            return
+        }
         busy = true
         shutter.alpha = 0.5f
         val m = mode
@@ -537,6 +543,51 @@ class CaptureActivity : Activity(), SurfaceHolder.Callback {
         ring.visibility = View.GONE
         countdown.visibility = View.GONE
         countdown.textSize = 56f
+    }
+
+    /**
+     * "Скрин": copies the viewfinder at the preview stream's full resolution (PixelCopy gives
+     * it in display orientation, front mirrored, exactly as shown) and saves it as a JPEG,
+     * with the EXIF rotation of how the phone is held. No capture request, no ISP still.
+     */
+    private fun shootPreviewFrame(s: CaptureSession) {
+        if (surface.width == 0) return
+        busy = true
+        shutter.alpha = 0.5f
+        animateCapture()
+        val buf = CaptureSession.previewSize(s.lens)
+        // Buffer is landscape (sensor); the portrait UI shows it rotated.
+        val (w, h) = if (buf.width > buf.height) buf.height to buf.width else buf.width to buf.height
+        val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        PixelCopy.request(surface, bmp, { result ->
+            if (result != PixelCopy.SUCCESS) {
+                status.text = "не удалось скопировать кадр"
+                busy = false; shutter.alpha = 1f
+                return@request
+            }
+            val rot = (deviceDegrees + 45) / 90 * 90 % 360
+            scope.launch {
+                try {
+                    val uri = withContext(Dispatchers.IO) {
+                        val out = java.io.ByteArrayOutputStream()
+                        bmp.compress(Bitmap.CompressFormat.JPEG, 97, out)
+                        val jpeg = dev.vegameta.rawzero.camera.ScreenLook.withOrientation(this@CaptureActivity, out.toByteArray(), ShotSaver.exifOrientation(rot))
+                        val name = "RZ_" + java.text.SimpleDateFormat("yyyyMMdd_HHmmss_SSS", java.util.Locale.US).format(java.util.Date()) + "_cam" + s.lens.id + "_screen"
+                        ShotSaver.saveJpeg(contentResolver, ShotSaver.DIR, name, jpeg)
+                    }
+                    lastPhoto = uri
+                    thumb.setImageBitmap(Bitmap.createScaledBitmap(bmp, w / 8, h / 8, true))
+                    status.text = "${s.lens.label}  кадр экрана ${w}×${h}"
+                    Log.i(TAG, "saved SKRIN ${w}x$h rotation $rot")
+                } catch (e: Throwable) {
+                    Log.e(TAG, "skrin", e)
+                    status.text = "ошибка: ${e.message}"
+                } finally {
+                    busy = false
+                    shutter.alpha = 1f
+                }
+            }
+        }, Handler(Looper.getMainLooper()))
     }
 
     /**
