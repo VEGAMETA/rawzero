@@ -360,7 +360,9 @@ class CaptureActivity : Activity(), SurfaceHolder.Callback {
     private fun process(shot: Shot, m: Mode): Triple<String, Uri, Bitmap?> {
         val name = ShotSaver.baseName(shot)
         val t0 = System.nanoTime()
-        val jpeg = Native.process(shot.raw, shot.lens.chars, shot.result, ShotSaver.exifOrientation(shot.jpegOrientation))
+        // Front camera keeps the mirror the preview showed (owner decision).
+        val mirror = if (shot.lens.front) shot.jpegOrientation else null
+        val jpeg = Native.process(shot.raw, shot.lens.chars, shot.result, ShotSaver.exifOrientation(shot.jpegOrientation), mirror)
         val ms = (System.nanoTime() - t0) / 1_000_000
         val uri = ShotSaver.saveJpeg(contentResolver, ShotSaver.DIR, name, jpeg)
         if (m == Mode.RAW) ShotSaver.saveDng(contentResolver, ShotSaver.DIR_DNG, name, shot)

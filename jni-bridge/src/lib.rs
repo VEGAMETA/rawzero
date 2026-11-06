@@ -24,7 +24,8 @@ pub mod ints {
     pub const CROP_Y: usize = 10;
     pub const CROP_W: usize = 11;
     pub const CROP_H: usize = 12;
-    pub const LEN: usize = 13;
+    pub const MIRROR: usize = 13; // 0 none, 1 reverse columns, 2 reverse rows (stored pixels)
+    pub const LEN: usize = 14;
 }
 
 /// `floats` layout: black level [0..4] (2x2 CFA, row-major), white level [4],
@@ -199,6 +200,11 @@ pub extern "system" fn Java_dev_vegameta_rawzero_Native_processRaw16<'caller>(
             let quality = read_ints(env, &ints_arr)?[ints::JPEG_QUALITY].clamp(1, 100) as u8;
             let raw = rawzero_core::unpack::unpack_raw16(bytes, w, h, stride)?;
             let (img, _t) = rawzero_core::process(&raw, &meta)?;
+            let img = match read_ints(env, &ints_arr)?[ints::MIRROR] {
+                1 => rawzero_core::image::mirror(&img, rawzero_core::image::Mirror::Columns),
+                2 => rawzero_core::image::mirror(&img, rawzero_core::image::Mirror::Rows),
+                _ => img,
+            };
             let jpeg = rawzero_core::encode::encode_jpeg(&img, quality, meta.orientation)?;
             Ok(env.byte_array_from_slice(&jpeg)?)
         })

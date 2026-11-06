@@ -55,10 +55,17 @@ object Native {
     private const val CROP_Y = 10
     private const val CROP_W = 11
     private const val CROP_H = 12
-    private const val INTS_LEN = 13
+    private const val MIRROR = 13
+    private const val INTS_LEN = 14
 
     /** Fills FrameMeta from CameraCharacteristics + CaptureResult and runs the pipeline. */
-    fun process(raw: Image, ch: CameraCharacteristics, r: CaptureResult, exifOrientation: Int, quality: Int = 92): ByteArray {
+    /**
+     * [mirrorDegrees]: null = no mirror; otherwise the JPEG rotation in degrees, and the photo
+     * is flipped left-right as displayed (selfie preview look). With a 90/270 rotation the
+     * displayed horizontal axis is the stored vertical one, so rows are reversed.
+     */
+    fun process(raw: Image, ch: CameraCharacteristics, r: CaptureResult, exifOrientation: Int,
+                mirrorDegrees: Int? = null, quality: Int = 92): ByteArray {
         require(raw.format == ImageFormat.RAW_SENSOR) { "format ${raw.format}" }
         val plane = raw.planes[0]
         val ints = IntArray(INTS_LEN)
@@ -69,6 +76,10 @@ object Native {
         ints[ILLUMINANT2] = ch[CameraCharacteristics.SENSOR_REFERENCE_ILLUMINANT2]?.toInt() ?: 0
         ints[HAL_SHADING_APPLIED] = if (ch[CameraCharacteristics.SENSOR_INFO_LENS_SHADING_APPLIED] == true) 1 else 0
         ints[JPEG_QUALITY] = quality
+        ints[MIRROR] = when (mirrorDegrees) {
+            null -> 0
+            else -> if (mirrorDegrees % 180 == 0) 1 else 2
+        }
 
         val lsm = r[CaptureResult.STATISTICS_LENS_SHADING_CORRECTION_MAP]
         val shading = lsm?.let { m ->

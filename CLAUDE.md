@@ -42,7 +42,7 @@ Non-goals:
 - **Samsung:** cameraserver hides IDs 20/21/23/50/52/56/58 per package. Under the package names `com.samsung.android.scan3d` or `com.samsung.android.ruler` (app flavors `scan3d`, `ruler`) they are visible and 50/52 deliver RAW_SENSOR. Physical streams through logical 20/21/23 fail; use the direct IDs. RAW is 10-bit with black level 0 and negatives clipped to 0 by the HAL (shadow bias, unrecoverable). Noise is white (single frame).
 - **Xiaomi:** no allow-list for this; hidden IDs 2/3/4 answer `getCameraCharacteristics`/`openCamera` from any package, `getCameraIdList()` just omits them. Opening hidden logical ID 5 crashed the camera provider: never open hidden logical cameras. HAL reports `LENS_SHADING_APPLIED=true` but the RAW is not shading-corrected (noise test, visual check): the GainMap must be applied.
 - Discover IDs on device by probing 0..127; never hardcode. Every lens must pass `tools/raw_noise.py` (white noise, `a` consistent with ISO, `corner` ratio for pre-applied shading) before it counts as "RAW".
-- `adb install` on HyperOS needs "Install via USB" enabled; `-g` is rejected, grant CAMERA with `pm grant`.
+- `adb install` on HyperOS needs "Install via USB" enabled and the screen on and unlocked (otherwise it is silently cancelled); `-g` is rejected, grant CAMERA with `pm grant`. Verify with `dumpsys package <pkg> | grep lastUpdateTime`.
 
 ## Architecture
 

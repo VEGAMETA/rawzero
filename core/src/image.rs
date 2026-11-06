@@ -72,9 +72,51 @@ pub fn crop(img: &RgbImage, r: Rect) -> Result<RgbImage, Error> {
     Ok(RgbImage { width: r.width, height: r.height, data })
 }
 
+/// Mirror axis in sensor (stored) pixel coordinates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mirror {
+    None,
+    /// Reverse each row (left <-> right in stored pixels).
+    Columns,
+    /// Reverse row order (top <-> bottom in stored pixels).
+    Rows,
+}
+
+/// Selfie mirror: front-camera photos keep the left-right flip the preview showed.
+/// Which stored axis that is depends on the EXIF rotation, so the caller picks it.
+pub fn mirror(img: &Rgb8Image, m: Mirror) -> Rgb8Image {
+    let (w, h) = (img.width, img.height);
+    let mut data = Vec::with_capacity(img.data.len());
+    match m {
+        Mirror::None => data.extend_from_slice(&img.data),
+        Mirror::Columns => {
+            for row in img.data.chunks_exact(w * 3) {
+                data.extend(row.chunks_exact(3).rev().flatten());
+            }
+        }
+        Mirror::Rows => {
+            for y in (0..h).rev() {
+                data.extend_from_slice(&img.data[y * w * 3..(y + 1) * w * 3]);
+            }
+        }
+    }
+    Rgb8Image { width: w, height: h, data }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mirror_axes() {
+        // 2x2 pixels a b / c d, one byte per channel value.
+        let px = |v: u8| [v, v, v];
+        let img = Rgb8Image { width: 2, height: 2, data: [px(1), px(2), px(3), px(4)].concat() };
+        let first = |i: &Rgb8Image| i.data.chunks(3).map(|p| p[0]).collect::<Vec<_>>();
+        assert_eq!(first(&mirror(&img, Mirror::Columns)), vec![2, 1, 4, 3]);
+        assert_eq!(first(&mirror(&img, Mirror::Rows)), vec![3, 4, 1, 2]);
+        assert_eq!(first(&mirror(&img, Mirror::None)), vec![1, 2, 3, 4]);
+    }
 
     #[test]
     fn crop_takes_inner_block() {
