@@ -59,6 +59,8 @@ import kotlinx.coroutines.withContext
 private const val TAG = "RawZero"
 private const val PREF_MODE = "mode"
 private const val PREF_DEV = "save_dev_pairs"
+/// Exposures from this length on get the ring + countdown indicator.
+private const val LONG_EXPOSURE_UI_NS = 500_000_000L
 
 enum class Mode(val title: String) { NIGHT("Ночь"), CLASSIC("Классика"), RAW("RAW") }
 
@@ -82,6 +84,9 @@ class CaptureActivity : Activity(), SurfaceHolder.Callback {
     private lateinit var shutter: View
     private lateinit var gear: Button
     private lateinit var thumb: ImageView
+    private lateinit var ring: dev.vegameta.rawzero.ui.ProgressRing
+    private lateinit var countdown: TextView
+    private var exposureAnim: android.animation.ValueAnimator? = null
     private lateinit var orientation: OrientationEventListener
 
     private var lenses: List<Lens> = emptyList()
@@ -140,6 +145,15 @@ class CaptureActivity : Activity(), SurfaceHolder.Callback {
             visibility = View.GONE
         }
         previewBox.addView(panel, FrameLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT, Gravity.BOTTOM))
+        countdown = TextView(this).apply {
+            setTextColor(Color.WHITE)
+            textSize = 56f
+            gravity = Gravity.CENTER
+            setShadowLayer(12f, 0f, 0f, Color.BLACK)
+            setBackgroundColor(Color.argb(90, 0, 0, 0))
+            visibility = View.GONE
+        }
+        previewBox.addView(countdown, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
         column.addView(previewBox, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
 
         column.addView(View(this), LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
@@ -174,6 +188,8 @@ class CaptureActivity : Activity(), SurfaceHolder.Callback {
             setOnClickListener { shoot() }
         }
         row.addView(shutter, FrameLayout.LayoutParams(dp(76), dp(76), Gravity.CENTER))
+        ring = dev.vegameta.rawzero.ui.ProgressRing(this).apply { visibility = View.GONE }
+        row.addView(ring, FrameLayout.LayoutParams(dp(92), dp(92), Gravity.CENTER))
         thumb = ImageView(this).apply {
             scaleType = ImageView.ScaleType.CENTER_CROP
             background = GradientDrawable().apply { cornerRadius = dp(12).toFloat(); setColor(Color.DKGRAY) }
@@ -291,6 +307,15 @@ class CaptureActivity : Activity(), SurfaceHolder.Callback {
             val wanted = intent.getStringExtra("lens")?.let { id -> lenses.firstOrNull { it.id == id } }
             if (lenses.isEmpty()) status.text = "RAW-камер не найдено"
             else select(wanted ?: lenses.firstOrNull { !it.front && it.eqMm in 20..30 } ?: lenses.first())
+            // Test presets after the lens is chosen: --el exp <ns> --ei iso <n> --ei kelvin <K>.
+            if (intent.hasExtra("exp") || intent.hasExtra("iso") || intent.hasExtra("kelvin")) {
+                update(Controls(
+                    exposureNs = intent.getLongExtra("exp", 0L).takeIf { it > 0 },
+                    iso = intent.getIntExtra("iso", 0).takeIf { it > 0 },
+                    kelvin = intent.getIntExtra("kelvin", 0).takeIf { it > 0 },
+                ))
+                current?.let(::buildPanel)
+            }
         }
     }
 
@@ -299,6 +324,7 @@ class CaptureActivity : Activity(), SurfaceHolder.Callback {
         for (i in 0 until lensBar.childCount) {
             lensBar.getChildAt(i).alpha = if (lenses[i] == lens) 1f else 0.45f
         }
+        // Lens ranges differ: keep only exposure compensation across a lens switch.
         update(Controls(evSteps = controls.evSteps))
         buildPanel(lens)
         // Portrait UI: the 4:3 landscape sensor frame shows as 3:4.
@@ -336,11 +362,18 @@ class CaptureActivity : Activity(), SurfaceHolder.Callback {
         shutter.alpha = 0.5f
         val m = mode
         animateCapture()
-        status.text = if (m == Mode.NIGHT) "ночь: склейка кадров ещё не готова, снимаю один кадр…" else "обработка…"
+        val longExp = controls.exposureNs?.takeIf { it >= LONG_EXPOSURE_UI_NS }
+        status.text = when {
+            longExp != null -> "держите телефон неподвижно"
+            m == Mode.NIGHT -> "ночь: склейка кадров ещё не готова, снимаю один кадр…"
+            else -> "обработка…"
+        }
+        longExp?.let(::startExposureIndicator)
         scope.launch {
             try {
                 val (msg, uri, bmp) = cameraLock.withLock {
                     val shot = s.shoot(ShotSaver.jpegOrientation(s.lens.chars, deviceDegrees))
+                    if (longExp != null) exposureDone()
                     shot.use { withContext(Dispatchers.Default) { process(it, m) } }
                 }
                 lastPhoto = uri
@@ -350,10 +383,49 @@ class CaptureActivity : Activity(), SurfaceHolder.Callback {
                 Log.e(TAG, "shoot", e)
                 status.text = "ошибка съёмки: ${e.message}"
             } finally {
+                stopExposureIndicator()
                 busy = false
                 shutter.alpha = 1f
             }
         }
+    }
+
+    /**
+     * Long exposure feedback: the preview freezes while the sensor integrates, so a ring
+     * around the shutter fills up and the frame shows a countdown of the remaining seconds.
+     */
+    private fun startExposureIndicator(exposureNs: Long) {
+        val ms = exposureNs / 1_000_000
+        ring.progress = 0f
+        ring.visibility = View.VISIBLE
+        countdown.visibility = View.VISIBLE
+        exposureAnim?.cancel()
+        exposureAnim = android.animation.ValueAnimator.ofFloat(0f, 1f).apply {
+            duration = ms
+            interpolator = android.view.animation.LinearInterpolator()
+            addUpdateListener {
+                val p = it.animatedValue as Float
+                ring.progress = p
+                val left = (ms * (1 - p)) / 1000.0
+                countdown.text = if (left >= 10) "%.0f".format(left) else "%.1f".format(left)
+            }
+            start()
+        }
+    }
+
+    private fun exposureDone() {
+        exposureAnim?.cancel()
+        ring.progress = 1f
+        countdown.textSize = 22f
+        countdown.text = "обработка…"
+    }
+
+    private fun stopExposureIndicator() {
+        exposureAnim?.cancel()
+        exposureAnim = null
+        ring.visibility = View.GONE
+        countdown.visibility = View.GONE
+        countdown.textSize = 56f
     }
 
     /** Our pipeline -> gallery JPEG; RAW mode adds the DNG; dev pairs keep DNG + ISP JPEG. */

@@ -85,7 +85,7 @@ object ShotSaver {
 
     fun summary(r: CaptureResult): String {
         val iso = r[CaptureResult.SENSOR_SENSITIVITY]
-        val exp = r[CaptureResult.SENSOR_EXPOSURE_TIME]?.let { if (it >= 1_000_000_000L) "%.1fs".format(it / 1e9) else "1/%.0f".format(1e9 / it) }
+        val exp = r[CaptureResult.SENSOR_EXPOSURE_TIME]?.let { formatExposure(it) }
         return "ISO $iso  $exp"
     }
 }

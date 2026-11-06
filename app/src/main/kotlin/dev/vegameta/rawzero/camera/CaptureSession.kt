@@ -108,7 +108,7 @@ class CaptureSession private constructor(
         controls = c
         val req = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
             addTarget(preview)
-            applyControls(lens, c, lastAutoAe, lastAutoAwb)
+            applyControls(lens, c, lastAutoAe, lastAutoAwb, preview = true)
         }.build()
         session.setRepeatingRequest(req, previewCallback, handler)
     }
@@ -129,13 +129,18 @@ class CaptureSession private constructor(
         val still = device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
             addTarget(rawReader.surface)
             addTarget(jpegReader.surface)
-            applyControls(lens, controls, lastAutoAe, lastAutoAwb)
+            applyControls(lens, controls, lastAutoAe, lastAutoAwb, preview = false)
             set(CaptureRequest.STATISTICS_LENS_SHADING_MAP_MODE, CameraMetadata.STATISTICS_LENS_SHADING_MAP_MODE_ON)
             set(CaptureRequest.JPEG_ORIENTATION, jpegOrientation)
             set(CaptureRequest.JPEG_QUALITY, 95.toByte())
         }.build()
-        return withTimeout(10_000) {
+        // Long exposures: the frame needs the exposure itself plus readout and processing.
+        val budgetMs = 10_000L + 2 * (controls.exposureNs ?: 0L) / 1_000_000
+        return withTimeout(budgetMs) {
+            val t0 = System.nanoTime()
             val result = session.captureAwait(still, handler)
+            android.util.Log.i("RawZero", "capture took ${(System.nanoTime() - t0) / 1_000_000} ms, " +
+                "result exp ${result.get(android.hardware.camera2.CaptureResult.SENSOR_EXPOSURE_TIME)} iso ${result.get(android.hardware.camera2.CaptureResult.SENSOR_SENSITIVITY)}")
             Shot(lens, rawImage.await(), jpegBytes.await(), result, jpegOrientation)
         }
     }
