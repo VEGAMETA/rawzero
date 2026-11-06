@@ -104,6 +104,10 @@ fun CaptureRequest.Builder.applyControls(
         set(QcomExposure.SELECT_PRIORITY, 0)
         set(QcomExposure.VALUE, 0L)
     }
+    // ISP-only gain is used solely to preview long exposures; 1x everywhere else.
+    if (ch[CameraCharacteristics.CONTROL_POST_RAW_SENSITIVITY_BOOST_RANGE] != null) {
+        set(CaptureRequest.CONTROL_POST_RAW_SENSITIVITY_BOOST, 100)
+    }
     if (c.exposureManual) {
         val meteredExp = lastAutoAe?.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: 10_000_000L
         val meteredIso = lastAutoAe?.get(CaptureResult.SENSOR_SENSITIVITY) ?: 400
@@ -115,8 +119,18 @@ fun CaptureRequest.Builder.applyControls(
         set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF)
         when {
             preview && exp > PREVIEW_MAX_EXPOSURE_NS -> {
+                // Show what the still will really get: exposure x ISO *after* the still's ISO
+                // clamp (shutter-only at 2 s indoors needs ISO ~13, the sensor floor is 50, so
+                // the photo is brighter than "auto"). Sensor ISO first, the rest as ISP gain on
+                // the processed preview stream only (POST_RAW_SENSITIVITY_BOOST, 100 = 1x).
+                val product = exp.toDouble() * clampIso(iso)
+                val wantIso = product / PREVIEW_MAX_EXPOSURE_NS
+                val sensorIso = clampIso(wantIso.roundToInt())
                 set(CaptureRequest.SENSOR_EXPOSURE_TIME, PREVIEW_MAX_EXPOSURE_NS)
-                set(CaptureRequest.SENSOR_SENSITIVITY, clampIso((iso.toDouble() * exp / PREVIEW_MAX_EXPOSURE_NS).roundToInt()))
+                set(CaptureRequest.SENSOR_SENSITIVITY, sensorIso)
+                ch[CameraCharacteristics.CONTROL_POST_RAW_SENSITIVITY_BOOST_RANGE]?.let { r ->
+                    set(CaptureRequest.CONTROL_POST_RAW_SENSITIVITY_BOOST, r.clamp((100 * wantIso / sensorIso).roundToInt()))
+                }
             }
             !preview && expRange != null && exp > expRange.upper && (QcomExposure.max(ch) ?: 0L) >= exp -> {
                 // Measured on Xiaomi 14 (2026-11-06): capture time matches the exposure and
