@@ -12,7 +12,9 @@ Three modes (owner decision, 2026-11-06):
 1. **Classic** (default, main focus). Single frame. A classical in-camera JPEG engine: noise reduction driven by the sensor noise profile (strong on chroma, gentle on luma), mild sharpening, global tone curve plus gentle single-frame shadow/highlight compression. Global look (exposure, white balance, contrast, saturation) matched to the ISP preview the user saw.
 2. **Process Zero**. Single frame, minimal pipeline: levels → shading → WB → demosaic → color → fixed global curve. No NR, no sharpening, no local operators; grain stays.
 3. **Night**. Burst of RAW frames, aligned and merged with a classical, non-ML method (HDR+-style, Hasinoff et al. 2016), then the Classic engine. Only on explicit user choice. (Not implemented yet: currently one Classic frame.)
-4. **Screen** ("Экран"). The ISP's own JPEG of the same request, saved as is (front mirrored like the preview): exactly what the screen showed, for when the user wants the phone's look.
+4. **Screen** ("Экран"). The ISP's full-resolution still JPEG (good detail) recolored to the preview: the HAL tunes preview and still differently (Xiaomi still is cooler/flatter), so per-channel histogram specification maps the still onto the preview frame grabbed at the shutter (`ScreenLook`). Front mirrored, EXIF rotation written by us (the Xiaomi HAL writes none).
+
+One photo per shot: front lens mirrored like the preview, rear normal. DNG only in RAW mode; dev pairs (DNG + ISP JPEG) are an opt-in toggle. Verified WYSIWYG on Xiaomi 14: the saved photo shown in the gallery and the preview before the shutter differ by ~1/255 in mean RGB on screen.
 
 Requirements:
 - Auto exposure and autofocus like a normal camera. The user never has to set anything manually.
@@ -87,7 +89,7 @@ Classic adds, each a separate pure function with a test, all parameters derived 
 - **Noise reduction** (`core/src/denoise.rs`) in the raw domain, after levels and before shading/WB/demosaic: each Bayer cell -> Y, Cr, Cb, Gd; Poisson-Gaussian model fitted blindly from Gd (no reliance on HAL noise profiles); Y by 8x8 Walsh-Hadamard hard threshold + empirical Wiener, stride 2, Kaiser aggregation; chroma by a guided filter on the denoised Y; `LUMA_GRAIN_KEEP` of the grain kept. Parallel (rayon) with fixed-order accumulation, so output hashes do not depend on thread count.
 - **Sharpening**: mild luma-only unsharp mask, amount scaled down with noise.
 - **Local tone**: edge-aware base/detail split of log luminance (guided filter), gentle base compression; no halos (verified on edges, `tools/`).
-- **Look match** (`core/src/look.rs`): the ISP JPEG of the same request (else the preview frame at the shutter) is the reference; global WB gains (mid-tone mean color) and a monotone tone curve (luminance histogram specification) are fitted from our linear render to it, so exposure, WB and contrast match what the user saw. Distribution-based (no registration), global, low-parameter; detail and noise handling are ours. Saturation is not matched yet.
+- **Look match** (`core/src/look.rs`): the preview frame grabbed at the shutter (PixelCopy; the ISP still only as fallback) is the reference; global WB gains (mid-tone mean color), a monotone tone curve (luminance histogram specification) and a saturation factor (mean mid-tone chroma) are fitted from our render to it. Distribution-based (no registration), global, low-parameter; detail and noise handling are ours.
 
 Process Zero forbids all of the above.
 

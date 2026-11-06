@@ -158,7 +158,42 @@ fn lum(p: &[f32; 3]) -> f32 {
 /// Linear RGB -> 8-bit sRGB through the luminance map, RGB ratios preserved. Channels
 /// pushed past 1 are pulled toward the pixel's luminance just enough to fit (keeps hue
 /// and brightness, gives up saturation only where it cannot be shown).
+/// Mean chroma (mean |c - Y'| over channels) of display-encoded mid-tone pixels.
+fn mean_chroma(px: &mut dyn Iterator<Item = [f32; 3]>) -> Option<f64> {
+    let (mut s, mut n) = (0.0f64, 0usize);
+    for p in px {
+        let y = LUMA[0] * p[0] + LUMA[1] * p[1] + LUMA[2] * p[2];
+        if !(0.15..=0.85).contains(&y) || p.iter().any(|&c| c >= 0.99) {
+            continue;
+        }
+        s += p.iter().map(|&c| (c - y).abs() as f64).sum::<f64>() / 3.0;
+        n += 1;
+    }
+    (n > 500).then(|| s / n as f64)
+}
+
+/// Saturation factor that gives our matched render the reference's mean mid-tone chroma
+/// (display-encoded). Clamped to 0.7..1.6: a global, single-parameter match.
+pub fn fit_saturation(ours: &RgbImage, tm: &ToneMap, reference: &Rgb8Image) -> f32 {
+    let step = (ours.data.len() / 200_000).max(1);
+    let sample = RgbImage { width: 0, height: 0, data: ours.data.iter().step_by(step).copied().collect() };
+    let rendered = render_matched_sat(&sample, tm, 1.0);
+    let a = mean_chroma(&mut rendered.data.chunks_exact(3).map(|p| [p[0] as f32 / 255.0, p[1] as f32 / 255.0, p[2] as f32 / 255.0]));
+    let rstep = (reference.data.len() / 3 / 200_000).max(1);
+    let b = mean_chroma(&mut reference.data.chunks_exact(3).step_by(rstep).map(|p| [p[0] as f32 / 255.0, p[1] as f32 / 255.0, p[2] as f32 / 255.0]));
+    match (a, b) {
+        (Some(a), Some(b)) if a > 1e-4 => ((b / a) as f32).clamp(0.7, 1.6),
+        _ => 1.0,
+    }
+}
+
 pub fn render_matched(img: &RgbImage, tm: &ToneMap) -> Rgb8Image {
+    render_matched_sat(img, tm, 1.0)
+}
+
+/// [render_matched] with a saturation factor applied in linear light around the pixel's
+/// luminance (hue and luminance kept).
+pub fn render_matched_sat(img: &RgbImage, tm: &ToneMap, sat: f32) -> Rgb8Image {
     // Gain LUT indexed by the top bits of the f32 luminance: exponent + 7 mantissa bits is
     // a piecewise-linear log2 with 128 steps per stop, no transcendental per pixel.
     const SHIFT: u32 = 16;
@@ -184,8 +219,13 @@ pub fn render_matched(img: &RgbImage, tm: &ToneMap) -> Rgb8Image {
             continue;
         }
         let g = gain_at(y);
-        let mut o = [p[0] * g, p[1] * g, p[2] * g];
         let yo = y * g;
+        let mut o = [p[0] * g, p[1] * g, p[2] * g];
+        if sat != 1.0 {
+            for c in &mut o {
+                *c = (yo + sat * (*c - yo)).max(0.0);
+            }
+        }
         let max = o[0].max(o[1]).max(o[2]);
         if max > 1.0 {
             // Blend toward gray at the same luminance until the largest channel fits.

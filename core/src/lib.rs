@@ -111,8 +111,9 @@ pub fn process_look(raw: &RawImage, meta: &FrameMeta, look: Look) -> Result<(Rgb
         Look::Classic(Some(r)) => {
             let rgb = look::apply_gains(&rgb, look::fit_wb(&rgb, r));
             let tm = look::ToneMap::fit(&rgb, r);
+            let sat = look::fit_saturation(&rgb, &tm, r);
             lap("look_fit", &mut t);
-            look::render_matched(&rgb, &tm)
+            look::render_matched_sat(&rgb, &tm, sat)
         }
     };
     lap("tone", &mut t);
