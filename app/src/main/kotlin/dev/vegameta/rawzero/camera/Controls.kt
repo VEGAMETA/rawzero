@@ -21,6 +21,11 @@ data class Controls(
     /** Center zoom (1 = full frame). Preview/ISP via CONTROL_ZOOM_RATIO; RAW is cropped by us. */
     val zoom: Float = 1f,
     val flash: Flash = Flash.OFF,
+    /**
+     * Tap-to-focus/meter point in sensor-normalized coordinates of the *visible* (zoomed)
+     * field of view, (0,0) top-left of the sensor image; null = whole-frame auto.
+     */
+    val meterPoint: Pair<Float, Float>? = null,
 ) {
     val exposureManual get() = exposureNs != null || iso != null
 }
@@ -35,6 +40,26 @@ fun zoomRange(ch: CameraCharacteristics): Pair<Float, Boolean> {
 }
 
 fun hasFlash(ch: CameraCharacteristics) = ch[CameraCharacteristics.FLASH_INFO_AVAILABLE] == true
+
+/**
+ * 3A region around [Controls.meterPoint]. Region coordinates are in the active array as if
+ * zoom were 1 (CONTROL_ZOOM_RATIO docs), so the point is mapped into the zoomed center crop.
+ * Size: 1/6 of the visible field's short side.
+ */
+fun meteringRect(ch: CameraCharacteristics, c: Controls): android.hardware.camera2.params.MeteringRectangle? {
+    val p = c.meterPoint ?: return null
+    val a = ch[CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE] ?: return null
+    val z = c.zoom.coerceIn(1f, zoomRange(ch).first)
+    val fw = a.width() / z
+    val fh = a.height() / z
+    val cx = (a.width() - fw) / 2 + p.first * fw
+    val cy = (a.height() - fh) / 2 + p.second * fh
+    val half = minOf(fw, fh) / 12
+    val l = (cx - half).coerceIn(0f, a.width() - 2 * half)
+    val t = (cy - half).coerceIn(0f, a.height() - 2 * half)
+    return android.hardware.camera2.params.MeteringRectangle(l.toInt(), t.toInt(), (2 * half).toInt(), (2 * half).toInt(),
+        android.hardware.camera2.params.MeteringRectangle.METERING_WEIGHT_MAX)
+}
 
 /** Longest exposure the preview runs at; longer manual exposures are simulated by ISO. */
 const val PREVIEW_MAX_EXPOSURE_NS = 33_333_333L
@@ -55,11 +80,34 @@ object QcomExposure {
 
     fun max(ch: CameraCharacteristics): Long? = runCatching { ch.get(RANGE)?.getOrNull(1) }.getOrNull()}
 
-/** Longest exposure a still capture can use on this lens. */
-fun maxStillExposure(ch: CameraCharacteristics): Long {
-    val std = ch[CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE]?.upper ?: 1_000_000_000L
+/**
+ * Samsung: `samsung.android.sensor.info.exposureTimeRange` advertises up to 20-30 s while
+ * SENSOR_INFO_EXPOSURE_TIME_RANGE stops at 0.1 s. Requests beyond the standard range are
+ * NOT honoured (1/30 s + gain, device error after 4 s): kept for diagnostics only.
+ */
+object SamsungExposure {
+    val RANGE = CameraCharacteristics.Key("samsung.android.sensor.info.exposureTimeRange", LongArray::class.java)
+    fun max(ch: CameraCharacteristics): Long? = runCatching { ch.get(RANGE)?.getOrNull(1) }.getOrNull()
+}
+
+/**
+ * Longest exposure the sensor really integrates in one frame: the standard range, or the
+ * Qualcomm priority range (Xiaomi, verified by RAW signal). Samsung's vendor range is NOT
+ * real: the HAL caps at 1/30 s, makes up the rest with gain and errored out the device
+ * after a 4 s request (measured 2026-11-06), so it is ignored.
+ */
+fun realMaxExposure(ch: CameraCharacteristics): Long {
+    val std = ch[CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE]?.upper ?: 100_000_000L
     return maxOf(std, QcomExposure.max(ch) ?: 0L)
 }
+
+/** Longest exposure offered: beyond [realMaxExposure] it is built by summing frames. */
+fun maxStillExposure(ch: CameraCharacteristics): Long = maxOf(realMaxExposure(ch), STACK_MAX_EXPOSURE_NS)
+
+/** Stacked long exposures go up to this (frames of the real maximum, summed). */
+const val STACK_MAX_EXPOSURE_NS = 30_000_000_000L
+/** Upper bound on frames in one stacked exposure. */
+const val STACK_MAX_FRAMES = 240
 
 /** Per-lens option lists for the settings sliders. Index 0 of each list is "auto". */
 class LensOptions(val lens: Lens) {
@@ -175,9 +223,18 @@ fun CaptureRequest.Builder.applyControls(
     }
 
     val af = ch[CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES] ?: intArrayOf()
+    val region = meteringRect(ch, c)
+    if (region != null && (ch[CameraCharacteristics.CONTROL_MAX_REGIONS_AE] ?: 0) > 0) {
+        set(CaptureRequest.CONTROL_AE_REGIONS, arrayOf(region))
+    }
     if (c.focusDiopters != null) {
         set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_OFF)
         set(CaptureRequest.LENS_FOCUS_DISTANCE, c.focusDiopters)
+    } else if (region != null && CameraMetadata.CONTROL_AF_MODE_AUTO in af && (ch[CameraCharacteristics.CONTROL_MAX_REGIONS_AF] ?: 0) > 0) {
+        // Tap to focus: single-shot AF on the region (triggered by CaptureSession.triggerFocus),
+        // the lens then stays where it focused.
+        set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_AUTO)
+        set(CaptureRequest.CONTROL_AF_REGIONS, arrayOf(region))
     } else if (CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE in af) {
         set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
     }

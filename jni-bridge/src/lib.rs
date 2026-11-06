@@ -28,7 +28,8 @@ pub mod ints {
     pub const MODE: usize = 14; // 0 Process Zero, 1 Classic (noise reduction + tone match)
     pub const REF_ROTATE_CW: usize = 15; // reference = our image rotated clockwise by this
     pub const REF_MIRROR: usize = 16; // ... then mirrored left-right (0/1)
-    pub const LEN: usize = 17;
+    pub const STACK: usize = 17; // burst handle: 0 = night align+merge, 1 = long-exposure sum
+    pub const LEN: usize = 18;
 }
 
 /// `floats` layout: black level [0..4] (2x2 CFA, row-major), white level [4],
@@ -251,8 +252,13 @@ fn encode(img: rawzero_core::Rgb8Image, iv: &[i32], meta: &FrameMeta) -> Result<
 }
 
 /// Night burst in progress: the HDR+ merger plus the first frame's metadata arrays.
+enum Accumulator {
+    Merge(rawzero_core::burst::BurstMerger),
+    Stack(rawzero_core::burst::ExposureStack),
+}
+
 struct Night {
-    merger: rawzero_core::burst::BurstMerger,
+    acc: Accumulator,
     iv: Vec<i32>,
 }
 
@@ -278,8 +284,12 @@ pub extern "system" fn Java_dev_vegameta_rawzero_Native_nightBegin<'caller>(
             let raw = read_raw(env, &raw, width, height, row_stride)?;
             let iv = read_ints(env, &ints_arr)?;
             let meta = read_meta(env, &iv, &floats_arr, &doubles_arr, &shading_arr, &make)?;
-            let merger = rawzero_core::burst::BurstMerger::new(&raw, &meta)?;
-            Ok(Box::into_raw(Box::new(Night { merger, iv })) as jni::sys::jlong)
+            let acc = if iv[ints::STACK] == 1 {
+                Accumulator::Stack(rawzero_core::burst::ExposureStack::new(&raw, &meta)?)
+            } else {
+                Accumulator::Merge(rawzero_core::burst::BurstMerger::new(&raw, &meta)?)
+            };
+            Ok(Box::into_raw(Box::new(Night { acc, iv })) as jni::sys::jlong)
         })
         .resolve::<jni::errors::ThrowRuntimeExAndDefault>()
 }
@@ -304,14 +314,17 @@ pub extern "system" fn Java_dev_vegameta_rawzero_Native_nightAdd<'caller>(
             // uses it from one coroutine at a time.
             let night = unsafe { &mut *(handle as *mut Night) };
             let raw = read_raw(env, &raw, width, height, row_stride)?;
-            night.merger.add(&raw)?;
-            Ok(night.merger.frames() as jint)
+            let n = match &mut night.acc {
+                Accumulator::Merge(m) => { m.add(&raw)?; m.frames() }
+                Accumulator::Stack(st) => { st.add(&raw)?; st.frames() }
+            };
+            Ok(n as jint)
         })
         .resolve::<jni::errors::ThrowRuntimeExAndDefault>()
 }
 
-/// `Native.nightFinish(handle, reference, refW, refH): ByteArray` - merged frame through the
-/// Classic pipeline; frees the handle.
+/// `Native.nightFinish(handle, reference, refW, refH): ByteArray` - merged / summed frame through
+/// the pipeline selected by MODE at begin (Classic for night); frees the handle.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_dev_vegameta_rawzero_Native_nightFinish<'caller>(
     mut unowned: EnvUnowned<'caller>,
@@ -329,9 +342,11 @@ pub extern "system" fn Java_dev_vegameta_rawzero_Native_nightFinish<'caller>(
             // SAFETY: as in nightAdd; ownership returns to Rust and is dropped here.
             let night = unsafe { Box::from_raw(handle as *mut Night) };
             let reference = read_reference(env, &reference_arr, ref_width, ref_height)?;
-            let mut iv = night.iv.clone();
-            iv[ints::MODE] = 1; // Night always finishes with the Classic engine.
-            let (mosaic, meta) = night.merger.finish();
+            let iv = night.iv.clone();
+            let (mosaic, meta) = match night.acc {
+                Accumulator::Merge(m) => m.finish(),
+                Accumulator::Stack(st) => st.finish(),
+            };
             let (img, _t) = rawzero_core::process_mosaic(mosaic, &meta, look_for(&iv, reference.as_ref()))?;
             Ok(env.byte_array_from_slice(&encode(img, &iv, &meta)?)?)
         })

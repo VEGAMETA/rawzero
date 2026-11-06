@@ -180,7 +180,8 @@ class CaptureActivity : Activity(), SurfaceHolder.Callback {
             background = GradientDrawable().apply { cornerRadius = dp(14).toFloat(); setColor(Color.argb(110, 0, 0, 0)) }
             setOnClickListener { setZoom(1f) }
         }
-        previewBox.addView(zoomLabel, FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT, Gravity.TOP or Gravity.CENTER_HORIZONTAL).apply { topMargin = dp(12) })
+        val topBar = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
+        topBar.addView(zoomLabel, FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT, Gravity.CENTER))
         flashButton = TextView(this).apply {
             setTextColor(Color.WHITE)
             textSize = 13f
@@ -193,16 +194,31 @@ class CaptureActivity : Activity(), SurfaceHolder.Callback {
                 update(controls.copy(flash = flashMode))
             }
         }
-        previewBox.addView(flashButton, FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT, Gravity.TOP or Gravity.START).apply { topMargin = dp(10); leftMargin = dp(10) })
+        topBar.addView(flashButton, FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT, Gravity.CENTER_VERTICAL or Gravity.START).apply { leftMargin = dp(12) })
         installZoomGestures()
+        buildFocusUi()
+        // Flash and zoom on a black bar above the frame; the frame moves down accordingly.
+        column.addView(topBar, LinearLayout.LayoutParams(MATCH_PARENT, dp(52)))
         column.addView(previewBox, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
 
         column.addView(View(this), LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
         status = TextView(this).apply { setTextColor(Color.LTGRAY); textSize = 12f; gravity = Gravity.CENTER }
         column.addView(status, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
-        lensBar = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER }
-        column.addView(HorizontalScrollView(this).apply { addView(lensBar); isHorizontalScrollBarEnabled = false },
-            LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { gravity = Gravity.CENTER_HORIZONTAL; topMargin = dp(6) })
+        // Lens choice on a grey pill rounded at both ends. The pill is the scrolling content
+        // itself, so its rounded ends are reached by scrolling, not pinned to the screen edges.
+        lensBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            setPadding(dp(6), dp(6), dp(6), dp(6))
+            background = GradientDrawable().apply { cornerRadius = dp(26).toFloat(); setColor(Color.rgb(34, 34, 37)) }
+        }
+        val lensScroll = HorizontalScrollView(this).apply {
+            isHorizontalScrollBarEnabled = false
+            clipToPadding = false
+            setPadding(dp(10), 0, dp(10), 0)
+            addView(lensBar, FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT))
+        }
+        column.addView(lensScroll, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { gravity = Gravity.CENTER_HORIZONTAL; topMargin = dp(6) })
         modeBar = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER }
         for (m in Mode.entries) {
             modeBar.addView(TextView(this).apply {
@@ -218,6 +234,10 @@ class CaptureActivity : Activity(), SurfaceHolder.Callback {
         gear = Button(this).apply {
             text = "AUTO"
             textSize = 11f
+            maxLines = 1
+            setPadding(0, 0, 0, 0)
+            // Fits "AUTO" in the circle at any display density / font scale (Samsung wrapped it).
+            setAutoSizeTextTypeUniformWithConfiguration(7, 12, 1, android.util.TypedValue.COMPLEX_UNIT_SP)
             isAllCaps = false
             setTextColor(Color.WHITE)
             background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(Color.argb(60, 255, 255, 255)) }
@@ -358,6 +378,16 @@ class CaptureActivity : Activity(), SurfaceHolder.Callback {
                 setZoom(if (controls.zoom > 1.01f) 1f else 2f)
                 return true
             }
+            override fun onSingleTapConfirmed(e: android.view.MotionEvent): Boolean {
+                tapToFocus(e.x, e.y)
+                return true
+            }
+            override fun onScroll(e1: android.view.MotionEvent?, e2: android.view.MotionEvent, dx: Float, dy: Float): Boolean {
+                // One-finger vertical drag after a tap: brightness for that point (sun slider).
+                if (controls.meterPoint == null || scale.isInProgress || e2.pointerCount > 1) return false
+                dragEv(dy)
+                return true
+            }
         })
         surface.setOnTouchListener { _, ev ->
             scale.onTouchEvent(ev)
@@ -366,9 +396,99 @@ class CaptureActivity : Activity(), SurfaceHolder.Callback {
         }
     }
 
+    // ------------------------------------------------------------ tap to focus / meter
+
+    private lateinit var focusRing: View
+    private lateinit var sunLabel: TextView
+    private var evDrag = 0f
+    private val meterHandler = Handler(Looper.getMainLooper())
+    private val meterReset = Runnable { clearMeterPoint() }
+
+    private fun buildFocusUi() {
+        focusRing = View(this).apply {
+            background = GradientDrawable().apply { setColor(Color.TRANSPARENT); setStroke(dp(2), Color.rgb(255, 204, 0)); cornerRadius = dp(4).toFloat() }
+            visibility = View.GONE
+        }
+        previewBox.addView(focusRing, FrameLayout.LayoutParams(dp(72), dp(72)))
+        sunLabel = TextView(this).apply {
+            setTextColor(Color.rgb(255, 204, 0))
+            textSize = 14f
+            setShadowLayer(6f, 0f, 0f, Color.BLACK)
+            visibility = View.GONE
+        }
+        previewBox.addView(sunLabel, FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT))
+    }
+
+    /**
+     * View point -> sensor-normalized point. The preview shows the sensor image rotated
+     * clockwise by SENSOR_ORIENTATION and mirrored for the front lens (measured: front 270 +
+     * mirror, rear 90), so undo the mirror, then the rotation.
+     */
+    private fun viewToSensor(u: Float, v: Float, lens: Lens): Pair<Float, Float> {
+        val rot = (lens.chars[android.hardware.camera2.CameraCharacteristics.SENSOR_ORIENTATION] ?: 0) % 360
+        val uu = if (lens.front) 1 - u else u
+        return when (rot) {
+            90 -> v to 1 - uu
+            180 -> 1 - uu to 1 - v
+            270 -> 1 - v to uu
+            else -> uu to v
+        }
+    }
+
+    private fun tapToFocus(x: Float, y: Float) {
+        val lens = current ?: return
+        if (surface.width == 0) return
+        val p = viewToSensor(x / surface.width, y / surface.height, lens)
+        evDrag = 0f
+        update(controls.copy(meterPoint = p, evSteps = 0))
+        session?.let { runCatching { it.triggerFocus() } }
+        Log.i(TAG, "tap ${"%.2f".format(x / surface.width)},${"%.2f".format(y / surface.height)} -> sensor ${"%.2f".format(p.first)},${"%.2f".format(p.second)} rect ${current?.let { dev.vegameta.rawzero.camera.meteringRect(it.chars, controls) }}")
+        // Ring centered on the finger, sun label to its right.
+        val r = dp(72)
+        focusRing.translationX = x - r / 2f
+        focusRing.translationY = y - r / 2f
+        focusRing.alpha = 1f
+        focusRing.scaleX = 1.3f; focusRing.scaleY = 1.3f
+        focusRing.visibility = View.VISIBLE
+        focusRing.animate().scaleX(1f).scaleY(1f).setDuration(200).start()
+        sunLabel.translationX = (x + r / 2f + dp(8)).coerceAtMost(surface.width - dp(64).toFloat())
+        sunLabel.translationY = y - dp(10)
+        sunLabel.text = "☀"
+        sunLabel.visibility = View.VISIBLE
+        armMeterReset()
+    }
+
+    private fun dragEv(dy: Float) {
+        val lens = current ?: return
+        if (controls.exposureManual) return
+        val o = LensOptions(lens)
+        evDrag += dy
+        // One compensation step per 10 dp of drag; up = brighter.
+        val steps = (evDrag / dp(10)).toInt()
+        if (steps == 0) return
+        evDrag -= steps * dp(10)
+        val ev = (controls.evSteps + steps).coerceIn(o.evRange.first, o.evRange.last)
+        if (ev != controls.evSteps) update(controls.copy(evSteps = ev))
+        sunLabel.text = "☀ %+.1f".format(ev * o.evStep)
+        armMeterReset()
+    }
+
+    /** The point holds while it is being used; 15 s after the last touch: back to auto. */
+    private fun armMeterReset() {
+        meterHandler.removeCallbacks(meterReset)
+        meterHandler.postDelayed(meterReset, 15_000)
+    }
+
+    private fun clearMeterPoint() {
+        meterHandler.removeCallbacks(meterReset)
+        focusRing.visibility = View.GONE
+        sunLabel.visibility = View.GONE
+        if (controls.meterPoint != null) update(controls.copy(meterPoint = null, evSteps = 0))
+    }
+
     private fun update(c: Controls) {
         controls = c
-        gear.text = if (c.copy(zoom = 1f, flash = dev.vegameta.rawzero.camera.Flash.OFF) == Controls()) "AUTO" else "M"
+        gear.text = if (c.copy(zoom = 1f, flash = dev.vegameta.rawzero.camera.Flash.OFF, meterPoint = null, evSteps = 0) == Controls()) "AUTO" else "M"
         val s = session ?: return
         runCatching { s.setControls(c) }.onFailure { Log.e(TAG, "controls", it) }
     }
@@ -433,6 +553,7 @@ class CaptureActivity : Activity(), SurfaceHolder.Callback {
         }
         // Lens ranges differ: keep only exposure compensation across a lens switch.
         prefs.edit().putString(PREF_LENS, lens.key).apply()
+        clearMeterPoint()
         update(Controls(evSteps = controls.evSteps, flash = flashMode))
         setZoom(1f)
         refreshFlash()
@@ -454,7 +575,16 @@ class CaptureActivity : Activity(), SurfaceHolder.Callback {
                 session?.close()
                 session = null
                 try {
-                    session = CaptureSession.open(cm, lens, surface.holder.surface, controls)
+                    session = CaptureSession.open(cm, lens, surface.holder.surface, controls) { why ->
+                        // Device lost after opening (HAL error): drop it and reopen.
+                        runOnUiThread {
+                            Log.w(TAG, "camera ${lens.key} lost ($why), reopening")
+                            status.text = "камера перезапускается…"
+                            session?.close()
+                            session = null
+                            if (surfaceReady) reopen()
+                        }
+                    }
                     status.text = lens.label
                     Log.i(TAG, "opened ${lens.id}")
                 } catch (e: kotlinx.coroutines.CancellationException) {
@@ -488,7 +618,9 @@ class CaptureActivity : Activity(), SurfaceHolder.Callback {
         longExp?.let(::startExposureIndicator)
         scope.launch {
             try {
-                val (msg, uri, bmp) = if (m == Mode.NIGHT && s.lens.raw) cameraLock.withLock { night(s) } else cameraLock.withLock {
+                val stackTotal = controls.exposureNs?.takeIf { s.lens.raw && it > dev.vegameta.rawzero.camera.realMaxExposure(s.lens.chars) && m != Mode.SCREEN }
+                val (msg, uri, bmp) = if (stackTotal != null) cameraLock.withLock { longExposure(s, stackTotal, m) }
+                else if (m == Mode.NIGHT && s.lens.raw) cameraLock.withLock { night(s) } else cameraLock.withLock {
                     val shot = s.shoot(ShotSaver.jpegOrientation(s.lens.chars, deviceDegrees))
                     if (longExp != null) exposureDone()
                     shot.use { withContext(Dispatchers.Default) { process(it, m) } }
@@ -498,8 +630,10 @@ class CaptureActivity : Activity(), SurfaceHolder.Callback {
                 status.text = msg
             } catch (e: Throwable) {
                 Log.e(TAG, "shoot", e)
-                status.text = "ошибка съёмки: ${e.message}"
+                status.text = "ошибка съёмки: ${e.message} (отчёт в Download/RawZero)"
+                writeReport(s, m, e)
             } finally {
+                if (s.rawFailed && s.lens.raw) demoteToIsp(s.lens)
                 stopExposureIndicator()
                 busy = false
                 shutter.alpha = 1f
@@ -543,6 +677,77 @@ class CaptureActivity : Activity(), SurfaceHolder.Callback {
         ring.visibility = View.GONE
         countdown.visibility = View.GONE
         countdown.textSize = 56f
+    }
+
+    private fun writeReport(s: CaptureSession, m: Mode, e: Throwable) {
+        val l = s.lens
+        val ch = l.chars
+        val text = buildString {
+            appendLine("RawZero error report")
+            appendLine("device: ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL} (${android.os.Build.DEVICE}), Android ${android.os.Build.VERSION.RELEASE} / SDK ${android.os.Build.VERSION.SDK_INT}")
+            appendLine("build: ${android.os.Build.FINGERPRINT}")
+            appendLine("hardware: ${android.os.Build.HARDWARE} soc ${runCatching { android.os.Build.SOC_MANUFACTURER + " " + android.os.Build.SOC_MODEL }.getOrNull()}")
+            appendLine("package: $packageName  mode: $m")
+            appendLine("lens: ${l.key} ${l.label} raw=${l.raw} ispJpeg=${l.ispJpeg} listed=${l.listed}")
+            appendLine("hw level: ${ch[android.hardware.camera2.CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL]}  caps: ${ch[android.hardware.camera2.CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES]?.joinToString()}")
+            appendLine("raw sizes: ${ch[android.hardware.camera2.CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP]?.let { m2 -> runCatching { m2.getOutputSizes(android.graphics.ImageFormat.RAW_SENSOR)?.joinToString() }.getOrNull() }}")
+            appendLine("controls: ${s.controls}")
+            appendLine("trace: ${s.trace}")
+            appendLine("lenses: " + lenses.joinToString { "${it.label}=${it.key}${if (it.raw) "" else "(ISP)"}" })
+            appendLine()
+            appendLine(Log.getStackTraceString(e))
+        }
+        runCatching { ShotSaver.saveReport(contentResolver, text) }.onFailure { Log.e(TAG, "report", it) }
+    }
+
+    /** RAW advertised but not delivered: use this lens as ISP-only from now on (and remember it). */
+    private fun demoteToIsp(lens: Lens) {
+        Log.w(TAG, "lens ${lens.key}: RAW not delivered, switching to ISP-only")
+        dev.vegameta.rawzero.camera.CameraCatalog.markIspOnly(this, lens)
+        val i = lenses.indexOf(lens)
+        if (i < 0) return
+        val isp = lens.copy(raw = false, ispJpeg = true).also { it.label = lens.label + " ·ISP" }
+        lenses = lenses.toMutableList().also { it[i] = isp }
+        (lensBar.getChildAt(i) as? Button)?.apply { text = isp.label; setOnClickListener { select(isp) } }
+        status.text = "${isp.label}: RAW с этой камеры не приходит, снимаю JPEG камеры"
+        select(isp)
+    }
+
+    /**
+     * Long exposure past the sensor's one-frame limit: the frames of the real maximum are
+     * summed in Rust (same light as one long frame, light trails included), then the mode's
+     * pipeline (Classic, or Process Zero in RAW mode).
+     */
+    private suspend fun longExposure(s: CaptureSession, total: Long, m: Mode): Triple<String, Uri, Bitmap?> {
+        val orientation = ShotSaver.jpegOrientation(s.lens.chars, deviceDegrees)
+        val mirror = if (s.lens.front) orientation else null
+        val sensorRot = s.lens.chars[android.hardware.camera2.CameraCharacteristics.SENSOR_ORIENTATION] ?: 0
+        val (frames, frameExp, iso) = s.stackPlan(total)
+        Log.i(TAG, "long exposure ${total / 1_000_000} ms = $frames x ${frameExp / 1_000_000} ms ISO $iso")
+        var burst: Native.NightBurst? = null
+        val t0 = System.nanoTime()
+        try {
+            s.shootStack(frames, frameExp, iso) { k, img, res ->
+                withContext(Dispatchers.Default) {
+                    if (k == 0) {
+                        burst = Native.NightBurst(img, s.lens.chars, res!!, ShotSaver.exifOrientation(orientation), mirror, sensorRot, s.lens.front,
+                            s.controls.zoom.coerceIn(1f, dev.vegameta.rawzero.camera.zoomRange(s.lens.chars).first), stack = true, classic = m != Mode.RAW)
+                    } else {
+                        burst!!.add(img)
+                    }
+                }
+            }
+            exposureDone()
+            val preview = shutterFrame
+            val jpeg = withContext(Dispatchers.Default) { burst!!.finish(preview?.takeIf { m != Mode.RAW }?.let(Native::referenceRgb)) }
+            val ms = (System.nanoTime() - t0) / 1_000_000
+            val name = "RZ_" + java.text.SimpleDateFormat("yyyyMMdd_HHmmss_SSS", java.util.Locale.US).format(java.util.Date()) + "_cam" + s.lens.id + "_long"
+            val uri = withContext(Dispatchers.IO) { ShotSaver.saveJpeg(contentResolver, ShotSaver.DIR, name, jpeg) }
+            Log.i(TAG, "saved $name long $frames frames ${ms}ms")
+            return Triple("${s.lens.label}  ${formatExposure(total)} = $frames кадров", uri, thumbnail(jpeg, orientation))
+        } finally {
+            burst?.close()
+        }
     }
 
     /**

@@ -311,10 +311,62 @@ impl BurstMerger {
     }
 }
 
+/// Long exposure by accumulation: the sum of N frames carries the same light as one N times
+/// longer exposure (light trails, smoothed water), only read noise grows by sqrt(N). Used
+/// where the sensor cannot expose long itself (Samsung HAL caps at 1/30 s and fakes the
+/// rest with gain; Xiaomi front tops out at 0.41 s). No alignment: tripod semantics.
+pub struct ExposureStack {
+    meta: FrameMeta,
+    width: usize,
+    height: usize,
+    sum: Vec<f32>,
+    frames: usize,
+}
+
+impl ExposureStack {
+    pub fn new(first: &RawImage, meta: &FrameMeta) -> Result<ExposureStack, Error> {
+        meta.validate()?;
+        let m = apply_levels(first, meta);
+        Ok(ExposureStack { meta: meta.clone(), width: first.width, height: first.height, sum: m.data, frames: 1 })
+    }
+
+    pub fn frames(&self) -> usize {
+        self.frames
+    }
+
+    pub fn add(&mut self, frame: &RawImage) -> Result<(), Error> {
+        if (frame.width, frame.height) != (self.width, self.height) {
+            return Err(Error::InvalidInput("stack frame size changed".into()));
+        }
+        let m = apply_levels(frame, &self.meta);
+        self.sum.iter_mut().zip(&m.data).for_each(|(s, v)| *s += v);
+        self.frames += 1;
+        Ok(())
+    }
+
+    /// Summed mosaic (may exceed 1 where the long exposure would clip; WB clips it).
+    pub fn finish(self) -> (Mosaic, FrameMeta) {
+        (Mosaic { width: self.width, height: self.height, data: self.sum }, self.meta)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::testutil::meta_rggb;
+
+    #[test]
+    fn stack_sums_light() {
+        let mut meta = meta_rggb();
+        meta.white_level = 1000.0;
+        let f = RawImage { width: 64, height: 64, data: vec![100; 64 * 64] };
+        let mut st = ExposureStack::new(&f, &meta).unwrap();
+        for _ in 0..3 {
+            st.add(&f).unwrap();
+        }
+        let (m, _) = st.finish();
+        assert!(m.data.iter().all(|&v| (v - 0.4).abs() < 1e-5));
+    }
 
     struct Rng(u64);
     impl Rng {

@@ -87,6 +87,17 @@ object CameraCatalog {
         }.let(::finish).takeIf { it.isNotEmpty() }
     }
 
+    /** Remembers that [lens] does not deliver RAW on this build (it was advertised but timed out). */
+    fun markIspOnly(ctx: Context, lens: Lens) {
+        val p = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val spec = p.getString("lenses", null) ?: return
+        val updated = spec.split(';').filter { it.isNotBlank() }.joinToString(";") { e ->
+            val f = e.split('|')
+            if (f[0] == lens.key) "${f[0]}|0|1" else e
+        }
+        p.edit().putString("lenses", updated).apply()
+    }
+
     /** Full scan with verification; [progress] gets (done, total). Stores the result. */
     suspend fun scan(ctx: Context, cm: CameraManager, progress: suspend (Int, Int) -> Unit): List<Lens> {
         val cands = candidates(cm)

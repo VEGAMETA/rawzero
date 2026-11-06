@@ -72,6 +72,18 @@ object ShotSaver {
         return null
     }
 
+    /** Diagnostics for remote users: a text file in Download/RawZero/ (no permission needed). */
+    fun saveReport(cr: ContentResolver, text: String) {
+        val name = "rawzero-error-" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date()) + ".txt"
+        val values = ContentValues().apply {
+            put(MediaStore.MediaColumns.DISPLAY_NAME, name)
+            put(MediaStore.MediaColumns.MIME_TYPE, "text/plain")
+            put(MediaStore.MediaColumns.RELATIVE_PATH, "Download/RawZero")
+        }
+        val uri = cr.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values) ?: return
+        cr.openOutputStream(uri)?.use { it.write(text.toByteArray()) }
+    }
+
     fun exifOrientation(degrees: Int) = when ((degrees % 360 + 360) % 360) {
         90 -> ExifInterface.ORIENTATION_ROTATE_90
         180 -> ExifInterface.ORIENTATION_ROTATE_180

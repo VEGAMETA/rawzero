@@ -20,6 +20,7 @@ import android.util.Size
 import android.view.Surface
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.Executor
 import kotlin.math.abs
 
@@ -86,6 +87,15 @@ class CaptureSession private constructor(
         override fun onCaptureCompleted(s: CameraCaptureSession, r: CaptureRequest, res: TotalCaptureResult) {
             if (r.get(CaptureRequest.CONTROL_AE_MODE) != CameraMetadata.CONTROL_AE_MODE_OFF) lastAutoAe = res
             if (r.get(CaptureRequest.CONTROL_AWB_MODE) != CameraMetadata.CONTROL_AWB_MODE_OFF) lastAutoAwb = res
+            if (afWatch > 0) {
+                afWatch--
+                val st = res.get(CaptureResult.CONTROL_AF_STATE)
+                if (st != lastAfState) {
+                    lastAfState = st
+                    Log.i("RawZero", "AF state $st (2 passive focused, 4 focused locked, 5 not focused locked) region ${res.get(CaptureResult.CONTROL_AF_REGIONS)?.firstOrNull()} " +
+                        "lens ${res.get(CaptureResult.LENS_FOCUS_DISTANCE)} ae ${res.get(CaptureResult.CONTROL_AE_STATE)}")
+                }
+            }
             // Preview health in logcat: frame rate and exposure every ~3 s.
             val now = System.nanoTime()
             fpsFrames++
@@ -138,7 +148,7 @@ class CaptureSession private constructor(
             return out
         }
 
-        suspend fun open(cm: CameraManager, lens: Lens, preview: Surface, controls: Controls): CaptureSession {
+        suspend fun open(cm: CameraManager, lens: Lens, preview: Surface, controls: Controls, onLost: (String) -> Unit = {}): CaptureSession {
             val thread = HandlerThread("camera-${lens.key}").apply { start() }
             val handler = Handler(thread.looper)
             val exec = Executor { handler.post(it) }
@@ -147,7 +157,7 @@ class CaptureSession private constructor(
             val jpegReader = readers.firstOrNull { it.imageFormat == ImageFormat.JPEG }
             var device: CameraDevice? = null
             try {
-                device = withTimeout(5_000) { cm.openAwait(lens.cameraId, handler) }
+                device = withTimeout(5_000) { cm.openAwait(lens.cameraId, handler, onLost) }
                 val outs = (listOf(preview) + readers.map { it.surface }).map { s ->
                     OutputConfiguration(s).apply { lens.physicalId?.let { setPhysicalCameraId(it) } }
                 }
@@ -161,6 +171,27 @@ class CaptureSession private constructor(
             }
         }
     }
+
+    /**
+     * Starts single-shot AF on the current meter point: cancel any previous scan, then
+     * AF_TRIGGER_START; the repeating request (AF_MODE_AUTO with the region) keeps the result.
+     */
+    fun triggerFocus() {
+        if (meteringRect(lens.chars, controls) == null) return
+        val base = {
+            device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
+                addTarget(preview)
+                applyControls(lens, controls, lastAutoAe, lastAutoAwb, preview = true)
+            }
+        }
+        session.capture(base().apply { set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_CANCEL) }.build(), null, handler)
+        session.capture(base().apply { set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_START) }.build(), previewCallback, handler)
+        afWatch = 30
+    }
+
+    /** Frames left to log AF state after a tap (debugging aid). */
+    @Volatile private var afWatch = 0
+    private var lastAfState: Int? = null
 
     /** Re-issues the repeating preview request with new settings. */
     fun setControls(c: Controls) {
@@ -197,39 +228,66 @@ class CaptureSession private constructor(
         jpegReader?.setOnImageAvailableListener({ r ->
             r.acquireNextImage()?.use { img ->
                 val buf = img.planes[0].buffer
-                jpegBytes.complete(ByteArray(buf.remaining()).also { buf.get(it) })
+                val bytes = ByteArray(buf.remaining()).also { buf.get(it) }
+                if (!jpegBytes.isCompleted) jpegBytes.complete(bytes)
             }
         }, handler)
-        val still = device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
-            rawReader?.let { addTarget(it.surface) }
+        val lsmOn = lens.chars[CameraCharacteristics.STATISTICS_INFO_AVAILABLE_LENS_SHADING_MAP_MODES]
+            ?.contains(CameraMetadata.STATISTICS_LENS_SHADING_MAP_MODE_ON) == true
+        fun still(withRaw: Boolean) = device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
+            if (withRaw) rawReader?.let { addTarget(it.surface) }
             jpegReader?.let { addTarget(it.surface) }
             applyControls(lens, controls, lastAutoAe, lastAutoAwb, preview = false)
-            set(CaptureRequest.STATISTICS_LENS_SHADING_MAP_MODE, CameraMetadata.STATISTICS_LENS_SHADING_MAP_MODE_ON)
+            if (lsmOn && withRaw) set(CaptureRequest.STATISTICS_LENS_SHADING_MAP_MODE, CameraMetadata.STATISTICS_LENS_SHADING_MAP_MODE_ON)
             set(CaptureRequest.JPEG_ORIENTATION, jpegOrientation)
             set(CaptureRequest.JPEG_QUALITY, 95.toByte())
         }.build()
         // Long exposures: the frame needs the exposure itself plus readout and processing.
-        val budgetMs = 10_000L + 2 * (controls.exposureNs ?: 0L) / 1_000_000
-        return withTimeout(budgetMs) {
-            val t0 = System.nanoTime()
-            val total = session.captureAwait(still, handler)
-            // A physical stream's metadata (black level, WB, shading map) is in its own result.
-            val result: CaptureResult = lens.physicalId?.let { total.physicalCameraTotalResults[it] } ?: total
-            Log.i("RawZero", "capture took ${(System.nanoTime() - t0) / 1_000_000} ms, " +
-                "result exp ${result.get(CaptureResult.SENSOR_EXPOSURE_TIME)} iso ${result.get(CaptureResult.SENSOR_SENSITIVITY)} flash ${result.get(CaptureResult.FLASH_STATE)}")
-            synchronized(lock) { inFlight++ }
-            val zoom = controls.zoom.coerceIn(1f, zoomRange(lens.chars).first)
-            val shot = Shot(lens, rawReader?.let { rawImage.await() }, jpegReader?.let { jpegBytes.await() }, result, total, jpegOrientation, zoom) {
-                synchronized(lock) {
-                    inFlight--
-                    if (closed && inFlight == 0) closeReaders()
-                }
-            }
-            // Re-arm the preview so no still-only state (long exposure, vendor priority) lingers.
-            runCatching { setControls(controls) }
-            shot
+        val budgetMs = 8_000L + 2 * (controls.exposureNs ?: 0L) / 1_000_000
+        val t0 = System.nanoTime()
+        trace = "still RAW=${rawReader != null} JPEG=${jpegReader != null}"
+        var total = withTimeoutOrNull(budgetMs) { session.captureAwait(still(rawReader != null), handler) }
+        trace += total?.let { " result ${(System.nanoTime() - t0) / 1_000_000}ms" } ?: " NO RESULT"
+        // Each output gets its own wait: some HALs advertise RAW + JPEG and then deliver only one.
+        var raw = rawReader?.let { withTimeoutOrNull(4_000) { rawImage.await() } }
+        var jpeg = jpegReader?.let { withTimeoutOrNull(if (raw != null) 4_000 else 1_000) { jpegBytes.await() } }
+        trace += " raw=${raw != null} jpeg=${jpeg != null}"
+        if (rawReader != null && raw == null) rawFailed = true
+        if (raw == null && jpeg == null && jpegReader != null) {
+            // Retry as the phone's own JPEG only (no RAW stream in the request).
+            Log.w("RawZero", "still delivered nothing ($trace), retrying JPEG only")
+            total = withTimeoutOrNull(budgetMs) { session.captureAwait(still(false), handler) }
+            jpeg = withTimeoutOrNull(4_000) { jpegBytes.await() }
+            trace += " | retry jpeg-only result=${total != null} jpeg=${jpeg != null}"
         }
+        if (total == null || (raw == null && jpeg == null)) {
+            runCatching { setControls(controls) }
+            throw IllegalStateException("камера не отдала кадр ($trace)")
+        }
+        // A physical stream's metadata (black level, WB, shading map) is in its own result.
+        val result: CaptureResult = lens.physicalId?.let { total.physicalCameraTotalResults[it] } ?: total
+        Log.i("RawZero", "capture took ${(System.nanoTime() - t0) / 1_000_000} ms ($trace), " +
+            "result exp ${result.get(CaptureResult.SENSOR_EXPOSURE_TIME)} iso ${result.get(CaptureResult.SENSOR_SENSITIVITY)} flash ${result.get(CaptureResult.FLASH_STATE)}")
+        synchronized(lock) { inFlight++ }
+        val zoom = controls.zoom.coerceIn(1f, zoomRange(lens.chars).first)
+        val shot = Shot(lens, raw, jpeg, result, total, jpegOrientation, zoom) {
+            synchronized(lock) {
+                inFlight--
+                if (closed && inFlight == 0) closeReaders()
+            }
+        }
+        // Re-arm the preview so no still-only state (long exposure, vendor priority) lingers.
+        runCatching { setControls(controls) }
+        return shot
     }
+
+    /** What the last still did, for error reports. */
+    @Volatile var trace = ""
+        private set
+
+    /** The HAL advertised RAW but did not deliver it: the lens should become ISP-only. */
+    @Volatile var rawFailed = false
+        private set
 
     /**
      * Night burst: [frames] RAW-only stills with identical settings - the metered exposure,
@@ -238,8 +296,32 @@ class CaptureSession private constructor(
      * agree. [onFrame] gets each image in order (with the result for frame 0) and must not
      * keep it: the reader is small and the HAL waits for free buffers.
      */
-    suspend fun shootNight(frames: Int, jpegOrientation: Int, onFrame: suspend (Int, Image, CaptureResult?) -> Unit) {
-        val reader = rawReader ?: error("night mode needs RAW")
+    suspend fun shootNight(frames: Int, jpegOrientation: Int, onFrame: suspend (Int, Image, CaptureResult?) -> Unit) =
+        shootBurst(frames, null, null, onFrame)
+
+    /**
+     * Long exposure by summing [frames] RAW frames of [frameExposure] at [iso] each (for
+     * exposures past the sensor's real one-frame limit).
+     */
+    suspend fun shootStack(frames: Int, frameExposure: Long, iso: Int, onFrame: suspend (Int, Image, CaptureResult?) -> Unit) =
+        shootBurst(frames, frameExposure, iso, onFrame)
+
+    /** Frames, per-frame exposure and ISO for a stacked long exposure of [total] ns. */
+    fun stackPlan(total: Long): Triple<Int, Long, Int> {
+        val ch = lens.chars
+        val frameExp = minOf(realMaxExposure(ch), total)
+        val frames = ((total + frameExp - 1) / frameExp).toInt().coerceIn(1, STACK_MAX_FRAMES)
+        val ae = lastAutoAe
+        val meteredExp = ae?.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: 33_000_000L
+        val meteredIso = ae?.get(CaptureResult.SENSOR_SENSITIVITY) ?: 800
+        val isoRange = ch[CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE]
+        // Same brightness rule as one long frame: total time x ISO = metered time x ISO.
+        val iso = (controls.iso ?: (meteredIso.toDouble() * meteredExp / total).toInt()).let { isoRange?.clamp(it) ?: it }
+        return Triple(frames, frameExp, iso)
+    }
+
+    private suspend fun shootBurst(frames: Int, fixedExp: Long?, fixedIso: Int?, onFrame: suspend (Int, Image, CaptureResult?) -> Unit) {
+        val reader = rawReader ?: error("burst needs RAW")
         preLight()
         drain(reader)
         val ae = lastAutoAe
@@ -248,10 +330,10 @@ class CaptureSession private constructor(
         val meteredIso = controls.iso ?: ae?.get(CaptureResult.SENSOR_SENSITIVITY) ?: 800
         val expRange = ch[CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE]
         val isoRange = ch[CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE]
-        val exp = minOf(meteredExp, NIGHT_MAX_EXPOSURE_NS).let { expRange?.clamp(it) ?: it }
-        val iso = (meteredIso.toDouble() * meteredExp / exp).toInt().let { isoRange?.clamp(it) ?: it }
+        val exp = fixedExp ?: minOf(meteredExp, NIGHT_MAX_EXPOSURE_NS).let { expRange?.clamp(it) ?: it }
+        val iso = fixedIso ?: (meteredIso.toDouble() * meteredExp / exp).toInt().let { isoRange?.clamp(it) ?: it }
         val focus = ae?.get(CaptureResult.LENS_FOCUS_DISTANCE)
-        Log.i("RawZero", "night: $frames x ${exp / 1_000_000} ms ISO $iso (metered ${meteredExp / 1_000_000} ms ISO $meteredIso)")
+        Log.i("RawZero", "burst: $frames x ${exp / 1_000_000} ms ISO $iso (metered ${meteredExp / 1_000_000} ms ISO $meteredIso)")
         val requests = (0 until frames).map {
             device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
                 addTarget(reader.surface)

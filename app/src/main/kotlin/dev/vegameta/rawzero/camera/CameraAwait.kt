@@ -17,7 +17,11 @@ import kotlin.coroutines.resumeWithException
 
 /** Coroutine wrappers over the Camera2 callback APIs. Late callbacks after cancellation close what they deliver. */
 
-suspend fun CameraManager.openAwait(id: String, handler: Handler): CameraDevice =
+/**
+ * Opens a camera. [onLost] fires if the device fails or disconnects *after* it was opened
+ * (e.g. the Samsung HAL erroring out after a long frame); the caller should reopen.
+ */
+suspend fun CameraManager.openAwait(id: String, handler: Handler, onLost: (String) -> Unit = {}): CameraDevice =
     suspendCancellableCoroutine { cont ->
         try {
             openCamera(id, object : CameraDevice.StateCallback() {
@@ -28,10 +32,12 @@ suspend fun CameraManager.openAwait(id: String, handler: Handler): CameraDevice 
                     d.close()
                     if (cont.isActive) cont.resumeWithException(
                         CameraAccessException(CameraAccessException.CAMERA_DISCONNECTED, "camera $id disconnected"))
+                    else onLost("disconnected")
                 }
                 override fun onError(d: CameraDevice, error: Int) {
                     d.close()
                     if (cont.isActive) cont.resumeWithException(IllegalStateException("camera $id open error $error"))
+                    else onLost("error $error")
                 }
             }, handler)
         } catch (e: Exception) {

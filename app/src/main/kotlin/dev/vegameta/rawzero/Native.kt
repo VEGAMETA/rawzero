@@ -84,7 +84,8 @@ object Native {
     private const val MODE = 14
     private const val REF_ROTATE_CW = 15
     private const val REF_MIRROR = 16
-    private const val INTS_LEN = 17
+    private const val STACK = 17
+    private const val INTS_LEN = 18
 
     /** Fills FrameMeta from CameraCharacteristics + CaptureResult and runs the pipeline. */
     /**
@@ -113,11 +114,14 @@ object Native {
      * live in native memory.
      */
     class NightBurst(first: Image, ch: CameraCharacteristics, r: CaptureResult, exifOrientation: Int,
-                     mirrorDegrees: Int?, refRotateCw: Int, refMirror: Boolean, zoom: Float = 1f) : AutoCloseable {
+                     mirrorDegrees: Int?, refRotateCw: Int, refMirror: Boolean, zoom: Float = 1f,
+                     /** true: long-exposure sum instead of night align+merge. */
+                     stack: Boolean = false, classic: Boolean = true) : AutoCloseable {
         private var handle: Long
 
         init {
-            val a = arrays(first, ch, r, exifOrientation, mirrorDegrees, true, refRotateCw, refMirror, 92, zoom)
+            val a = arrays(first, ch, r, exifOrientation, mirrorDegrees, classic, refRotateCw, refMirror, 92, zoom)
+            a.ints[STACK] = if (stack) 1 else 0
             val p = first.planes[0]
             handle = nightBegin(p.buffer, first.width, first.height, p.rowStride, a.ints, a.floats, a.doubles, a.shading, Build.MANUFACTURER)
         }
