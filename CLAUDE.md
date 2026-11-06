@@ -6,19 +6,24 @@
 
 ## Goal
 
-An Android camera with no computational photography: **one RAW frame → minimal deterministic pipeline → one JPEG/HEIC** in the gallery. An Android equivalent of Halide's Process Zero.
+An Android camera for two people (Xiaomi 14 primary, Samsung S21 Ultra as test/reference/second platform) that takes **good, natural photos from good camera hardware, with no AI**: one shot → deterministic classical pipeline → one JPEG in the gallery, looking like what the screen showed when shooting. RAW (DNG) is an option, not the default.
+
+Three modes (owner decision, 2026-11-06):
+1. **Classic** (default, main focus). Single frame. A classical in-camera JPEG engine: noise reduction driven by the sensor noise profile (strong on chroma, gentle on luma), mild sharpening, global tone curve plus gentle single-frame shadow/highlight compression. Global look (exposure, white balance, contrast, saturation) matched to the ISP preview the user saw.
+2. **Process Zero**. Single frame, minimal pipeline: levels → shading → WB → demosaic → color → fixed global curve. No NR, no sharpening, no local operators; grain stays.
+3. **Night**. Burst of RAW frames, aligned and merged with a classical, non-ML method (HDR+-style, Hasinoff et al. 2016), then the Classic engine. Only on explicit user choice.
 
 Requirements:
 - Auto exposure and autofocus like a normal camera. The user never has to set anything manually.
 - One file per shot in the gallery. DNG is optional and goes to a separate folder.
-- The phone must not heat up (the main problem with MotionCam).
-- Honest image: grain instead of "watercolor"; no HDR merges, neural nets, beautification or sharpening.
+- The phone must not heat up (the main problem with MotionCam). Preview stays on the hardware ISP.
+- All cameras: every rear lens and the front camera (front matters for the users).
 
 Non-goals:
-- Multi-frame merging (HDR+, night mode, multi-frame denoise) — deliberately excluded; this is exactly what we are escaping.
-- ML models of any kind.
-- `CameraExtensionSession` (vendor HDR/Night) — that is vendor processing.
-- Quad-Bayer remosaic to full resolution — also vendor processing (see Pitfalls).
+- ML models of any kind (no neural denoise, segmentation, face retouch, "AI scene").
+- `CameraExtensionSession` (vendor HDR/Night) and vendor-processed stock DNGs — that is vendor processing.
+- Content-aware "smart" corrections (sky/face detection, beautification).
+- Quad-Bayer remosaic to full resolution — vendor processing.
 
 ## Target devices
 
@@ -73,10 +78,16 @@ Strictly in this order; each step is a separate function with a test:
 5. **White balance:** gains from `COLOR_CORRECTION_GAINS` in the result.
 6. **Demosaic:** Malvar–He–Cutler first; AHD later as an option. Respect `SENSOR_INFO_COLOR_FILTER_ARRANGEMENT`.
 7. **Color:** camera RGB → XYZ(D50) via `SENSOR_FORWARD_MATRIX1/2` (interpolated by color temperature), then XYZ → linear sRGB (Bradford D50→D65).
-8. **Tone:** one fixed, gentle global S-curve (no local tone mapping), then sRGB OETF.
+8. **Tone:** global curve then sRGB OETF. Process Zero: one fixed gentle S-curve. Classic: curve and exposure fitted to the ISP output of the same moment (see below), plus gentle single-frame local tone compression.
 9. **Encode:** JPEG (quality ~92) or HEIC, with EXIF and orientation. Optional DNG via `DngCreator` into `Pictures/RawZero/DNG/`.
 
-Forbidden in the pipeline: denoising, unsharp mask or any sharpening, local tone mapping, content-aware "smart" corrections. If ever added, only as an explicit user toggle, off by default.
+Classic adds, each a separate pure function with a test, all parameters derived from metadata (noise profile, ISO), never from image content classification:
+- **Noise reduction** after color conversion, in an opponent space (luma + 2 chroma), strength from `SENSOR_NOISE_PROFILE` / DNG `NoiseProfile`.
+- **Sharpening**: mild luma-only unsharp mask, amount scaled down with noise.
+- **Local tone**: edge-aware base/detail split of log luminance (guided filter), gentle base compression; no halos (verified on edges, `tools/`).
+- **Look match**: at capture the ISP JPEG/YUV of the same request is kept as a reference; a global tone curve and 3x3 color correction are fitted from our linear render to it, so exposure, WB and saturation match what the user saw. Only global, low-parameter mappings; detail comes from our pipeline.
+
+Process Zero forbids all of the above.
 
 ## Verification (tools/)
 
@@ -107,11 +118,12 @@ Forbidden in the pipeline: denoising, unsharp mask or any sharpening, local tone
 
 ## Milestones
 
-1. `desktop/`: DNG → JPEG, steps 1–9 on CPU, validated against darktable.
-2. Android MVP: preview + shutter + RAW → JNI → JPEG into the gallery. Main camera only.
-3. `tools/` scripts and an ISP behavior report for Xiaomi 14 and S21 Ultra.
-4. Camera selection (all available IDs), DNG option, EXIF.
-5. GPU path (wgpu), only if milestone 2 is too slow.
+1. `desktop/`: DNG → JPEG, steps 1–9 on CPU (done: Process Zero baseline; darktable comparison pending).
+2. Capture tool in `app/`: ISP preview, all cameras (discovered IDs), shutter → DNG + ISP JPEG of the same request into `Pictures/RawZero/dev/`. Builds the reference dataset for the look work.
+3. Classic engine in `core`, desktop-first, evaluated against the ISP references (noise, sharpness, look match).
+4. Android MVP: JNI, mode switch (Classic / Process Zero), JPEG into the gallery, optional DNG, EXIF.
+5. Night mode (burst align + merge).
+6. GPU path (wgpu), only if CPU misses the time target.
 
 ## Owner
 
