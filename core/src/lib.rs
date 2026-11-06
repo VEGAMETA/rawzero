@@ -55,7 +55,24 @@ pub enum Look<'a> {
     Fixed,
     /// Classic: raw-domain noise reduction (denoise.rs) and a global tone curve fitted to
     /// the ISP output of the same request (look.rs); fixed curve when no reference exists.
-    Classic(Option<&'a Rgb8Image>),
+    Classic(Option<look::Reference<'a>>),
+}
+
+/// Linear sRGB render (steps 2..7, Process Zero, no crop): diagnostics such as the look
+/// reference orientation scan.
+pub fn render_linear(raw: &RawImage, meta: &FrameMeta) -> Result<RgbImage, Error> {
+    meta.validate()?;
+    let mut m = levels::apply_levels(raw, meta);
+    if let Some(map) = &meta.lens_shading {
+        m = shading::apply_lens_shading(&m, map, meta.cfa);
+    }
+    let m = wb::apply_white_balance(&m, wb::cell_gains(meta));
+    let rgb = demosaic::demosaic_mhc(&m, meta.cfa);
+    let rgb = match meta.crop {
+        Some(r) => image::crop(&rgb, r)?,
+        None => rgb,
+    };
+    Ok(color::apply_matrix(&rgb, &color::camera_to_srgb(&meta.color, wb::camera_neutral(meta))?))
 }
 
 /// Steps 2..8 on an unpacked frame (Process Zero). Encoding is separate.
@@ -108,8 +125,20 @@ pub fn process_look(raw: &RawImage, meta: &FrameMeta, look: Look) -> Result<(Rgb
     lap("color", &mut t);
     let out = match look {
         Look::Fixed | Look::Classic(None) => tone::render_8bit(&rgb, &tone::build_lut()),
-        Look::Classic(Some(r)) => {
-            let rgb = look::apply_gains(&rgb, look::fit_wb(&rgb, r));
+        Look::Classic(Some(reference)) => {
+            let r = reference.image;
+            // Hue/WB: full 3x3 chromaticity match to the reference when it registers,
+            // else per-channel WB gains (distribution-based, needs no registration).
+            let rgb = match look::fit_ccm(&rgb, &reference) {
+                Some(m) => {
+                    lap("ccm", &mut t);
+                    color::apply_matrix(&rgb, &m)
+                }
+                None => {
+                    lap("wb_gains", &mut t);
+                    look::apply_gains(&rgb, look::fit_wb(&rgb, r))
+                }
+            };
             let tm = look::ToneMap::fit(&rgb, r);
             let sat = look::fit_saturation(&rgb, &tm, r);
             lap("look_fit", &mut t);

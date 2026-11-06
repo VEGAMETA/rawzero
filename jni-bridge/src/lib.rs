@@ -26,7 +26,9 @@ pub mod ints {
     pub const CROP_H: usize = 12;
     pub const MIRROR: usize = 13; // 0 none, 1 reverse columns, 2 reverse rows (stored pixels)
     pub const MODE: usize = 14; // 0 Process Zero, 1 Classic (noise reduction + tone match)
-    pub const LEN: usize = 15;
+    pub const REF_ROTATE_CW: usize = 15; // reference = our image rotated clockwise by this
+    pub const REF_MIRROR: usize = 16; // ... then mirrored left-right (0/1)
+    pub const LEN: usize = 17;
 }
 
 /// `floats` layout: black level [0..4] (2x2 CFA, row-major), white level [4],
@@ -216,8 +218,10 @@ pub extern "system" fn Java_dev_vegameta_rawzero_Native_processRaw16<'caller>(
                 }
                 Some(rawzero_core::Rgb8Image { width: rw, height: rh, data: v.into_iter().map(|b| b as u8).collect() })
             };
-            let look = if read_ints(env, &ints_arr)?[ints::MODE] == 1 {
-                rawzero_core::Look::Classic(reference.as_ref())
+            let iv = read_ints(env, &ints_arr)?;
+            let geometry = rawzero_core::look::RefGeometry { rotate_cw: iv[ints::REF_ROTATE_CW].rem_euclid(360) as u16, mirror: iv[ints::REF_MIRROR] != 0 };
+            let look = if iv[ints::MODE] == 1 {
+                rawzero_core::Look::Classic(reference.as_ref().map(|image| rawzero_core::look::Reference { image, geometry }))
             } else {
                 rawzero_core::Look::Fixed
             };

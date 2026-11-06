@@ -146,6 +146,227 @@ pub fn fit_wb(ours: &RgbImage, reference: &Rgb8Image) -> [f32; 3] {
     g.map(|v| v as f32)
 }
 
+/// How the reference is oriented relative to our sensor-oriented render: the preview frame
+/// is our image rotated clockwise by `rotate_cw` degrees, then mirrored left-right.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct RefGeometry {
+    pub rotate_cw: u16,
+    pub mirror: bool,
+}
+
+/// A look reference: the preview frame (or ISP still) and how it maps onto our image.
+#[derive(Clone, Copy, Debug)]
+pub struct Reference<'a> {
+    pub image: &'a Rgb8Image,
+    pub geometry: RefGeometry,
+}
+
+/// Grid of block means in linear light: (mean RGB, luminance relative std) per cell.
+fn block_means(lin: &dyn Fn(usize, usize) -> [f32; 3], w: usize, h: usize, gx: usize, gy: usize) -> Vec<([f64; 3], f64)> {
+    let mut out = Vec::with_capacity(gx * gy);
+    for j in 0..gy {
+        for i in 0..gx {
+            let (x0, x1) = (i * w / gx, (i + 1) * w / gx);
+            let (y0, y1) = (j * h / gy, (j + 1) * h / gy);
+            let (sx, sy) = (((x1 - x0) / 12).max(1), ((y1 - y0) / 12).max(1));
+            let (mut s, mut l1, mut l2, mut n) = ([0.0f64; 3], 0.0f64, 0.0f64, 0.0f64);
+            for y in (y0..y1).step_by(sy) {
+                for x in (x0..x1).step_by(sx) {
+                    let p = lin(x, y);
+                    let l = lum(&p) as f64;
+                    for c in 0..3 {
+                        s[c] += p[c] as f64;
+                    }
+                    l1 += l;
+                    l2 += l * l;
+                    n += 1.0;
+                }
+            }
+            let m = s.map(|v| v / n);
+            let ml = l1 / n;
+            let sd = ((l2 / n - ml * ml).max(0.0)).sqrt() / ml.max(1e-6);
+            out.push((m, sd));
+        }
+    }
+    out
+}
+
+/// Full 3x3 color match to the reference (the ISP's hue rendering, e.g. warmer, redder
+/// skin than the sensor's forward matrix gives). Fitted on *chromaticity* only: every grid
+/// cell is normalized to unit luminance in both images, so the reference's nonlinear tone
+/// curve cannot leak into the matrix (the tone curve is fitted afterwards). Cells are paired
+/// through [RefGeometry]; only smooth mid-tone cells are used (robust to the small shift
+/// between preview frame and still), with a ridge toward the diagonal (WB-only) solution.
+/// Returns None when the fit is unreliable (too few cells, poor residual, odd matrix).
+pub fn fit_ccm(ours: &RgbImage, r: &Reference) -> Option<[[f32; 3]; 3]> {
+    const G: usize = 24;
+    let lut: Vec<f32> = (0..256).map(|i| srgb_eotf(i as f32 / 255.0)).collect();
+    let rimg = r.image;
+    let rw = rimg.width;
+    let ref_px = |x: usize, y: usize| {
+        let i = (y * rw + x) * 3;
+        [lut[rimg.data[i] as usize], lut[rimg.data[i + 1] as usize], lut[rimg.data[i + 2] as usize]]
+    };
+    let gy = (G as f32 * rimg.height as f32 / rimg.width as f32).round().max(4.0) as usize;
+    let rcells = block_means(&ref_px, rimg.width, rimg.height, G, gy);
+    let rot = r.geometry.rotate_cw % 360;
+    let (ox, oy) = if rot % 180 == 0 { (G, gy) } else { (gy, G) };
+    let our_px = |x: usize, y: usize| ours.data[y * ours.width + x];
+    let ocells = block_means(&our_px, ours.width, ours.height, ox, oy);
+    // Reference cell (i, j) -> our cell: undo the mirror, then the clockwise rotation.
+    // Rotating (W, H) by 90 CW sends (x, y) to (H-1-y, x); 180 to (W-1-x, H-1-y);
+    // 270 to (y, W-1-x). Inverted on the grids (ours is ox x oy cells).
+    let map = |i: usize, j: usize| -> usize {
+        let i = if r.geometry.mirror { G - 1 - i } else { i };
+        let (x, y) = match rot {
+            90 => (j, G - 1 - i),
+            180 => (G - 1 - i, gy - 1 - j),
+            270 => (gy - 1 - j, i),
+            _ => (i, j),
+        };
+        y * ox + x
+    };
+    // Registration check: log-luminance of paired cells must correlate. A wrong orientation
+    // or a different field of view (Xiaomi tele still vs RAW) fails here -> WB-gain fallback.
+    if registration(&rcells, &ocells, G, gy, &map) < MIN_REGISTRATION {
+        return None;
+    }
+    let mut a = [[0.0f64; 3]; 3];
+    let mut b = [[0.0f64; 3]; 3];
+    let mut n = 0usize;
+    let mut pairs = Vec::new();
+    for j in 0..gy {
+        for i in 0..G {
+            let (rm, rsd) = rcells[j * G + i];
+            let (om, osd) = ocells[map(i, j)];
+            let (ry, oyl) = (lum_f64(&rm), lum_f64(&om));
+            if !(0.01..0.8).contains(&ry) || oyl < 1e-4 || rsd > 0.25 || osd > 0.25 || rm.iter().chain(&om).any(|&v| v <= 0.0) {
+                continue;
+            }
+            let on = om.map(|v| v / oyl);
+            let rn = rm.map(|v| v / ry);
+            for p in 0..3 {
+                for q in 0..3 {
+                    a[p][q] += on[p] * on[q];
+                    b[p][q] += on[p] * rn[q];
+                }
+            }
+            pairs.push((on, rn));
+            n += 1;
+        }
+    }
+    if n < 60 {
+        return None;
+    }
+    // Ridge toward the diagonal: lambda * |M - diag(d)|^2, d from per-channel means ratio.
+    let d: [f64; 3] = std::array::from_fn(|c| {
+        let (so, sr) = pairs.iter().fold((0.0, 0.0), |(so, sr), (o, r)| (so + o[c], sr + r[c]));
+        sr / so.max(1e-9)
+    });
+    let lambda = 0.02 * (a[0][0] + a[1][1] + a[2][2]) / 3.0;
+    for p in 0..3 {
+        a[p][p] += lambda;
+    }
+    let inv = crate::color::inverse(&a).ok()?;
+    let mut m = [[0.0f64; 3]; 3];
+    for c in 0..3 {
+        // Column c of B plus the ridge target for output channel c.
+        let rhs: [f64; 3] = std::array::from_fn(|p| b[p][c] + if p == c { lambda * d[c] } else { 0.0 });
+        let row = crate::color::mul_vec(&inv, rhs);
+        m[c] = row;
+    }
+    // Keep luminance: Y(M * gray) = Y(gray), so the tone fit alone sets brightness.
+    let gy_out = lum_f64(&crate::color::mul_vec(&m, [1.0, 1.0, 1.0]));
+    if !(gy_out > 0.2) {
+        return None;
+    }
+    let m = m.map(|row| row.map(|v| v / gy_out));
+    // Sanity: positive, dominant diagonal; the fit must beat the diagonal model.
+    if (0..3).any(|c| m[c][c] < 0.3 || m[c][c] < m[c].iter().enumerate().filter(|(k, _)| *k != c).map(|(_, v)| v.abs()).sum::<f64>() * 0.6) {
+        return None;
+    }
+    let err = |f: &dyn Fn([f64; 3]) -> [f64; 3]| pairs.iter().map(|(o, r)| { let p = f(*o); let yp = lum_f64(&p).max(1e-9); (0..3).map(|c| (p[c] / yp - r[c]).powi(2)).sum::<f64>() }).sum::<f64>();
+    let e_full = err(&|o| crate::color::mul_vec(&m, o));
+    let e_diag = err(&|o| [o[0] * d[0], o[1] * d[1], o[2] * d[2]]);
+    if !(e_full <= e_diag * 1.05) {
+        return None;
+    }
+    Some(m.map(|row| row.map(|v| v as f32)))
+}
+
+/// Pearson correlation of log luminance between paired reference / our grid cells.
+fn registration(rcells: &[([f64; 3], f64)], ocells: &[([f64; 3], f64)], g: usize, gy: usize, map: &dyn Fn(usize, usize) -> usize) -> f64 {
+    let (mut xs, mut ys) = (Vec::new(), Vec::new());
+    for j in 0..gy {
+        for i in 0..g {
+            let (a, b) = (lum_f64(&rcells[j * g + i].0), lum_f64(&ocells[map(i, j)].0));
+            if a > 1e-5 && b > 1e-6 {
+                xs.push(a.ln());
+                ys.push(b.ln());
+            }
+        }
+    }
+    if xs.len() < 20 {
+        return 0.0;
+    }
+    let n = xs.len() as f64;
+    let (mx, my) = (xs.iter().sum::<f64>() / n, ys.iter().sum::<f64>() / n);
+    let (mut sxy, mut sxx, mut syy) = (0.0, 0.0, 0.0);
+    for (x, y) in xs.iter().zip(&ys) {
+        sxy += (x - mx) * (y - my);
+        sxx += (x - mx) * (x - mx);
+        syy += (y - my) * (y - my);
+    }
+    sxy / (sxx * syy).sqrt().max(1e-12)
+}
+
+/// Minimum luminance correlation for the 3x3 color fit to be trusted.
+const MIN_REGISTRATION: f64 = 0.85;
+
+/// Registration score of every orientation (diagnostics: which way the reference is turned).
+pub fn registration_scan(ours: &RgbImage, reference: &Rgb8Image) -> Vec<(RefGeometry, f64)> {
+    let mut out = Vec::new();
+    for rotate_cw in [0u16, 90, 180, 270] {
+        for mirror in [false, true] {
+            let geometry = RefGeometry { rotate_cw, mirror };
+            out.push((geometry, registration_score(ours, &Reference { image: reference, geometry })));
+        }
+    }
+    out
+}
+
+fn registration_score(ours: &RgbImage, r: &Reference) -> f64 {
+    const G: usize = 24;
+    let lut: Vec<f32> = (0..256).map(|i| srgb_eotf(i as f32 / 255.0)).collect();
+    let rimg = r.image;
+    let rw = rimg.width;
+    let ref_px = |x: usize, y: usize| {
+        let i = (y * rw + x) * 3;
+        [lut[rimg.data[i] as usize], lut[rimg.data[i + 1] as usize], lut[rimg.data[i + 2] as usize]]
+    };
+    let gy = (G as f32 * rimg.height as f32 / rimg.width as f32).round().max(4.0) as usize;
+    let rcells = block_means(&ref_px, rimg.width, rimg.height, G, gy);
+    let rot = r.geometry.rotate_cw % 360;
+    let (ox, oy) = if rot % 180 == 0 { (G, gy) } else { (gy, G) };
+    let our_px = |x: usize, y: usize| ours.data[y * ours.width + x];
+    let ocells = block_means(&our_px, ours.width, ours.height, ox, oy);
+    let map = |i: usize, j: usize| -> usize {
+        let i = if r.geometry.mirror { G - 1 - i } else { i };
+        let (x, y) = match rot {
+            90 => (j, G - 1 - i),
+            180 => (G - 1 - i, gy - 1 - j),
+            270 => (gy - 1 - j, i),
+            _ => (i, j),
+        };
+        y * ox + x
+    };
+    registration(&rcells, &ocells, G, gy, &map)
+}
+
+fn lum_f64(p: &[f64; 3]) -> f64 {
+    LUMA[0] as f64 * p[0] + LUMA[1] as f64 * p[1] + LUMA[2] as f64 * p[2]
+}
+
 pub fn apply_gains(img: &RgbImage, g: [f32; 3]) -> RgbImage {
     RgbImage { width: img.width, height: img.height, data: img.data.iter().map(|p| [p[0] * g[0], p[1] * g[1], p[2] * g[2]]).collect() }
 }
@@ -290,6 +511,51 @@ mod tests {
         let reference = Rgb8Image { width: 2000, height: 1, data: ours.data.iter().flat_map(|p| [p[0] * 1.3, p[1], p[2] * 0.8].map(|c| (srgb_oetf(c) * 255.0 + 0.5) as u8)).collect() };
         let g = fit_wb(&ours, &reference);
         assert!((g[0] - 1.3).abs() < 0.03 && g[1] == 1.0 && (g[2] - 0.8).abs() < 0.03, "{g:?}");
+    }
+
+    #[test]
+    fn ccm_fit_recovers_hue_matrix_through_rotation_and_mirror() {
+        // Smooth patches of different colors (constant within grid-sized blocks).
+        let (w, h) = (480, 360);
+        let patch = |x: usize, y: usize| -> [f32; 3] {
+            let (i, j) = (x * 12 / w, y * 9 / h);
+            let t = (i * 7 + j * 3) % 11;
+            [0.05 + 0.03 * t as f32, 0.08 + 0.02 * ((t * 5) % 11) as f32, 0.06 + 0.025 * ((t * 3) % 11) as f32]
+        };
+        let ours = RgbImage { width: w, height: h, data: (0..w * h).map(|k| patch(k % w, k / w)).collect() };
+        // Reference: warmer hue rendering (luminance-neutral mix), rotated 90 CW, mirrored.
+        let m: [[f32; 3]; 3] = [[1.15, -0.10, -0.05], [-0.05, 1.05, 0.0], [-0.02, -0.15, 1.17]];
+        let (rw, rh) = (h, w);
+        let mut data = vec![0u8; rw * rh * 3];
+        for y in 0..h {
+            for x in 0..w {
+                let p = ours.data[y * w + x];
+                let q: [f32; 3] = std::array::from_fn(|c| m[c][0] * p[0] + m[c][1] * p[1] + m[c][2] * p[2]);
+                // rotate 90 CW: (x, y) -> (h-1-y, x); then mirror: u -> rw-1-u.
+                let (u, v) = (rw - 1 - (h - 1 - y), x);
+                let i = (v * rw + u) * 3;
+                for c in 0..3 {
+                    data[i + c] = (srgb_oetf(q[c].clamp(0.0, 1.0)) * 255.0 + 0.5) as u8;
+                }
+            }
+        }
+        let reference = Rgb8Image { width: rw, height: rh, data };
+        let r = Reference { image: &reference, geometry: RefGeometry { rotate_cw: 90, mirror: true } };
+        let fit = fit_ccm(&ours, &r).expect("fit");
+        // Compare normalized to the same luminance scale.
+        let ym = |a: &[[f32; 3]; 3]| (0..3).map(|c| LUMA[c] * a[c].iter().sum::<f32>()).sum::<f32>();
+        let (sf, sm) = (ym(&fit), ym(&m));
+        for c in 0..3 {
+            for k in 0..3 {
+                assert!((fit[c][k] / sf - m[c][k] / sm).abs() < 0.06, "{fit:?} vs {m:?}");
+            }
+        }
+        // Wrong geometry must not produce a confident wrong answer.
+        let wrong = Reference { image: &reference, geometry: RefGeometry { rotate_cw: 0, mirror: false } };
+        if let Some(f) = fit_ccm(&ours, &wrong) {
+            let off: f32 = (0..3).map(|c| (f[c][c] / ym(&f) - m[c][c] / sm).abs()).sum();
+            assert!(off > 0.0);
+        }
     }
 
     #[test]

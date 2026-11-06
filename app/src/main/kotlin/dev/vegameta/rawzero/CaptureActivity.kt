@@ -126,6 +126,7 @@ class CaptureActivity : Activity(), SurfaceHolder.Callback {
         loadLastThumbnail()
         // Testing: `--es mode CLASSIC|NIGHT|RAW|SCREEN`.
         intent.getStringExtra("mode")?.let { runCatching { mode = Mode.valueOf(it); refreshModes() } }
+        if (intent.hasExtra("dev")) prefs.edit().putBoolean(PREF_DEV, intent.getBooleanExtra("dev", false)).apply()
     }
 
     override fun onRequestPermissionsResult(code: Int, perms: Array<out String>, results: IntArray) {
@@ -494,14 +495,23 @@ class CaptureActivity : Activity(), SurfaceHolder.Callback {
             shot.ispJpeg != null -> Native.referenceRgb(shot.ispJpeg)
             else -> null
         }
+        // The preview frame is the sensor image rotated by SENSOR_ORIENTATION (portrait UI) and
+        // mirrored for the front lens; the ISP still has the RAW's orientation.
+        val previewRef = preview != null && m != Mode.RAW
+        val sensorRot = shot.lens.chars[android.hardware.camera2.CameraCharacteristics.SENSOR_ORIENTATION] ?: 0
         val jpeg = Native.process(raw, shot.lens.chars, shot.result, ShotSaver.exifOrientation(shot.jpegOrientation), mirror, reference,
-            classic = m != Mode.RAW)
+            classic = m != Mode.RAW, refRotateCw = if (previewRef) sensorRot else 0, refMirror = previewRef && shot.lens.front)
         val ms = (System.nanoTime() - t0) / 1_000_000
         val uri = ShotSaver.saveJpeg(contentResolver, ShotSaver.DIR, name, jpeg)
         if (m == Mode.RAW) ShotSaver.saveDng(contentResolver, ShotSaver.DIR_DNG, name, shot)
         if (prefs.getBoolean(PREF_DEV, false)) {
             ShotSaver.saveDng(contentResolver, ShotSaver.DIR_DEV, name, shot)
             shot.ispJpeg?.let { ShotSaver.saveJpeg(contentResolver, ShotSaver.DIR_DEV, name + "_isp", it) }
+            preview?.let { bmp ->
+                val o = java.io.ByteArrayOutputStream()
+                bmp.compress(Bitmap.CompressFormat.JPEG, 98, o)
+                ShotSaver.saveJpeg(contentResolver, ShotSaver.DIR_DEV, name + "_preview", o.toByteArray())
+            }
         }
         Log.i(TAG, "saved $name mode $m pipeline ${ms}ms ${ShotSaver.summary(shot.result)}")
         return Triple("${shot.lens.label}  ${ShotSaver.summary(shot.result)}  $ms мс", uri, thumbnail(jpeg, shot.jpegOrientation))

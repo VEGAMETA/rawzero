@@ -26,8 +26,9 @@ use crate::meta::{CfaPattern, B, G, R};
 pub const LUMA_GRAIN_KEEP: f32 = 0.25;
 /// Hard threshold in units of the local sigma (BM3D uses 2.7).
 const HARD_LAMBDA: f32 = 2.7;
-/// Guided filter radius on the half-resolution planes (16 px at full resolution).
-const CHROMA_RADIUS: usize = 8;
+/// Guided filter radius on the half-resolution planes (4 px at full resolution): residual
+/// blotch cleanup only, the main chroma denoising is transform-domain.
+const CHROMA_RADIUS: usize = 2;
 
 /// var(x) = s * x + o for a single photosite, x normalized (0 = black, 1 = white), before WB.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -400,11 +401,18 @@ pub fn denoise_mosaic(m: &Mosaic, cfa: CfaPattern, nm: NoiseModel) -> Mosaic {
     let y_out: Vec<f32> = yd.iter().zip(&p.y).map(|(&d, &o)| d + LUMA_GRAIN_KEEP * (o - d)).collect();
 
     let vg: Vec<f32> = gm.iter().map(|&g| nm.var(g)).collect();
-    // Guide regularization: 4x the guide's noise variance, so residual luma noise in the
-    // (already denoised) guide cannot imprint itself on chroma; real luma edges are far above.
+    // Chroma: the same transform-domain shrinkage with each plane's own noise variance keeps
+    // chroma edges that stand above the noise even where luminance is flat (lips vs skin at
+    // dusk). A guided filter alone averaged such regions into one hue ("sepia").
+    // var(Cr) = vR + vG/2, var(Cb) = vB + vG/2, levels from the smoothed planes.
+    let var_cr: Vec<f32> = (0..w * h).map(|i| nm.var(gm[i] + crs[i]) + 0.5 * vg[i]).collect();
+    let var_cb: Vec<f32> = (0..w * h).map(|i| nm.var(gm[i] + cbs[i]) + 0.5 * vg[i]).collect();
+    let crd = denoise_luma(&p.cr, &var_cr, w, h);
+    let cbd = denoise_luma(&p.cb, &var_cb, w, h);
+    // Residual low-frequency blotches: small guided filter by the denoised luminance.
     let eps: Vec<f32> = var_y.iter().map(|v| 4.0 * v).collect();
-    p.cr = guided(&yd, &p.cr, &eps, w, h, CHROMA_RADIUS);
-    p.cb = guided(&yd, &p.cb, &eps, w, h, CHROMA_RADIUS);
+    p.cr = guided(&yd, &crd, &eps, w, h, CHROMA_RADIUS);
+    p.cb = guided(&yd, &cbd, &eps, w, h, CHROMA_RADIUS);
     // Gd: local Wiener, signal energy from a 3x3 window.
     let gd2: Vec<f32> = p.gd.iter().map(|v| v * v).collect();
     let e = box_mean(&gd2, w, h, 1);

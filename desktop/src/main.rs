@@ -15,7 +15,10 @@ const USAGE: &str = "usage: rawzero <input.dng> [-o out.jpg] [-q quality] [--fix
   --fix-hot-pixels   run hot pixel suppression (DNG does not say whether the HAL did it)
   --no-shading       skip lens shading even if the DNG carries a GainMap
   --classic          Classic mode: raw noise reduction (+ tone match with --ref)
-  --ref ISP.jpg      Classic look: match the tone of this ISP JPEG of the same shot (implies --classic)
+  --ref IMG          Classic look reference: ISP JPEG / preview PNG of the same shot (implies --classic)
+  --ref-rot DEG      reference = our image rotated clockwise by DEG (preview frames: sensor orientation)
+  --ref-mirror       ... and mirrored left-right (front-camera preview frames)
+  --ref-scan         print the reference registration score for every orientation and exit
   --info             print metadata and exit";
 
 struct Args {
@@ -27,11 +30,14 @@ struct Args {
     info: bool,
     reference: Option<PathBuf>,
     classic: bool,
+    ref_rot: u16,
+    ref_mirror: bool,
+    ref_scan: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
     let mut it = std::env::args().skip(1);
-    let mut a = Args { input: PathBuf::new(), output: None, quality: DEFAULT_QUALITY, fix_hot: false, no_shading: false, info: false, reference: None, classic: false };
+    let mut a = Args { input: PathBuf::new(), output: None, quality: DEFAULT_QUALITY, fix_hot: false, no_shading: false, info: false, reference: None, classic: false, ref_rot: 0, ref_mirror: false, ref_scan: false };
     let mut input = None;
     while let Some(s) = it.next() {
         match s.as_str() {
@@ -41,6 +47,9 @@ fn parse_args() -> Result<Args, String> {
             "--no-shading" => a.no_shading = true,
             "--ref" => a.reference = Some(it.next().ok_or("--ref needs a path")?.into()),
             "--classic" => a.classic = true,
+            "--ref-rot" => a.ref_rot = it.next().and_then(|v| v.parse().ok()).ok_or("--ref-rot needs degrees")?,
+            "--ref-mirror" => a.ref_mirror = true,
+            "--ref-scan" => a.ref_scan = true,
             "--info" => a.info = true,
             "-h" | "--help" => return Err(USAGE.into()),
             _ if s.starts_with('-') => return Err(format!("unknown option {s}\n{USAGE}")),
@@ -90,7 +99,21 @@ fn run() -> Result<(), String> {
     }
 
     let reference = args.reference.as_deref().map(read_jpeg).transpose()?;
-    let look = if args.classic || reference.is_some() { rawzero_core::Look::Classic(reference.as_ref()) } else { rawzero_core::Look::Fixed };
+    if args.ref_scan {
+        let r = reference.as_ref().ok_or("--ref-scan needs --ref")?;
+        let lin = rawzero_core::render_linear(&d.raw, &d.meta).map_err(|e| e.to_string())?;
+        for (g, score) in rawzero_core::look::registration_scan(&lin, r) {
+            eprintln!("rotate_cw {:3} mirror {:5}: luminance correlation {score:.3}", g.rotate_cw, g.mirror);
+        }
+        return Ok(());
+    }
+    // The ISP still has the RAW's orientation: identity geometry.
+    let look = if args.classic || reference.is_some() {
+        let geometry = rawzero_core::look::RefGeometry { rotate_cw: args.ref_rot, mirror: args.ref_mirror };
+        rawzero_core::Look::Classic(reference.as_ref().map(|image| rawzero_core::look::Reference { image, geometry }))
+    } else {
+        rawzero_core::Look::Fixed
+    };
     let (img, timings) = rawzero_core::process_look(&d.raw, &d.meta, look).map_err(|e| e.to_string())?;
     let t1 = Instant::now();
     let jpeg = encode_jpeg(&img, args.quality, d.meta.orientation).map_err(|e| e.to_string())?;

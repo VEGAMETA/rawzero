@@ -82,7 +82,9 @@ object Native {
     private const val CROP_H = 12
     private const val MIRROR = 13
     private const val MODE = 14
-    private const val INTS_LEN = 15
+    private const val REF_ROTATE_CW = 15
+    private const val REF_MIRROR = 16
+    private const val INTS_LEN = 17
 
     /** Fills FrameMeta from CameraCharacteristics + CaptureResult and runs the pipeline. */
     /**
@@ -92,7 +94,7 @@ object Native {
      */
     fun process(raw: Image, ch: CameraCharacteristics, r: CaptureResult, exifOrientation: Int,
                 mirrorDegrees: Int? = null, reference: Triple<ByteArray, Int, Int>? = null,
-                classic: Boolean = false, quality: Int = 92): ByteArray {
+                classic: Boolean = false, refRotateCw: Int = 0, refMirror: Boolean = false, quality: Int = 92): ByteArray {
         require(raw.format == ImageFormat.RAW_SENSOR) { "format ${raw.format}" }
         val plane = raw.planes[0]
         val ints = IntArray(INTS_LEN)
@@ -104,6 +106,8 @@ object Native {
         ints[HAL_SHADING_APPLIED] = if (ch[CameraCharacteristics.SENSOR_INFO_LENS_SHADING_APPLIED] == true) 1 else 0
         ints[JPEG_QUALITY] = quality
         ints[MODE] = if (classic) 1 else 0
+        ints[REF_ROTATE_CW] = refRotateCw
+        ints[REF_MIRROR] = if (refMirror) 1 else 0
         ints[MIRROR] = when (mirrorDegrees) {
             null -> 0
             else -> if (mirrorDegrees % 180 == 0) 1 else 2
