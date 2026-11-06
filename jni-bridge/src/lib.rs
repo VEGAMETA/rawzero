@@ -77,23 +77,7 @@ pub fn build_meta(i: &[i32], f: &[f32], d: &[f64], shading: Option<&[f32]>, make
         return Err(BridgeError::Input(format!("array lengths {} / {} / {}", i.len(), f.len(), d.len())));
     }
     let cfa = CfaPattern::from_camera2(i[ints::CFA])?;
-    let cm1 = mat(d, 0).ok_or_else(|| BridgeError::Input("SENSOR_COLOR_TRANSFORM1 missing".into()))?;
-    let ident = rawzero_core::color::IDENTITY;
-    let cal1 = Calibration {
-        illuminant: i[ints::ILLUMINANT1] as u16,
-        color_matrix: cm1,
-        forward_matrix: mat(d, 2),
-        camera_calibration: mat(d, 4).unwrap_or(ident),
-    };
-    let cal2 = match (i[ints::ILLUMINANT2], mat(d, 1)) {
-        (il, Some(cm)) if il > 0 => Some(Calibration {
-            illuminant: il as u16,
-            color_matrix: cm,
-            forward_matrix: mat(d, 3),
-            camera_calibration: mat(d, 5).unwrap_or(ident),
-        }),
-        _ => None,
-    };
+    let color = color_profile(i, d)?;
     let hal_applied = i[ints::HAL_SHADING_APPLIED] != 0;
     let lens_shading = match shading {
         Some(s) if rawzero_core::meta::needs_lens_shading(make, hal_applied) => {
@@ -118,12 +102,44 @@ pub fn build_meta(i: &[i32], f: &[f32], d: &[f64], shading: Option<&[f32]>, make
         lens_shading,
         hot_pixels_corrected: i[ints::HOT_PIXELS_CORRECTED] != 0,
         wb_gains: [f[5], f[6], f[7], f[8]],
-        color: ColorProfile { cal1, cal2, analog_balance: [1.0; 3] },
+        color,
         orientation: i[ints::ORIENTATION] as u16,
         crop,
     };
     meta.validate()?;
     Ok(meta)
+}
+
+/// Color calibration part of the arrays (illuminants from `ints`, matrices from `doubles`).
+pub fn color_profile(i: &[i32], d: &[f64]) -> Result<ColorProfile, BridgeError> {
+    if i.len() < ints::LEN || d.len() < DOUBLES_LEN {
+        return Err(BridgeError::Input(format!("array lengths {} / {}", i.len(), d.len())));
+    }
+    let cm1 = mat(d, 0).ok_or_else(|| BridgeError::Input("SENSOR_COLOR_TRANSFORM1 missing".into()))?;
+    let ident = rawzero_core::color::IDENTITY;
+    let cal1 = Calibration {
+        illuminant: i[ints::ILLUMINANT1] as u16,
+        color_matrix: cm1,
+        forward_matrix: mat(d, 2),
+        camera_calibration: mat(d, 4).unwrap_or(ident),
+    };
+    let cal2 = match (i[ints::ILLUMINANT2], mat(d, 1)) {
+        (il, Some(cm)) if il > 0 => Some(Calibration {
+            illuminant: il as u16,
+            color_matrix: cm,
+            forward_matrix: mat(d, 3),
+            camera_calibration: mat(d, 5).unwrap_or(ident),
+        }),
+        _ => None,
+    };
+    Ok(ColorProfile { cal1, cal2, analog_balance: [1.0; 3] })
+}
+
+/// COLOR_CORRECTION_GAINS `[R, G_even, G_odd, B]` (green = 1) for a Planckian white at `kelvin`.
+pub fn wb_gains(i: &[i32], d: &[f64], kelvin: f64) -> Result<[f32; 4], BridgeError> {
+    let n = rawzero_core::color::neutral_for_temperature(&color_profile(i, d)?, kelvin)?;
+    let g = [n[1] / n[0], 1.0, 1.0, n[1] / n[2]];
+    Ok(g.map(|v| v as f32))
 }
 
 fn read_ints(env: &Env, a: &JIntArray) -> Result<Vec<i32>, BridgeError> {
@@ -189,6 +205,25 @@ pub extern "system" fn Java_dev_vegameta_rawzero_Native_processRaw16<'caller>(
         .resolve::<jni::errors::ThrowRuntimeExAndDefault>()
 }
 
+/// `Native.wbGains(ints, doubles, kelvin): FloatArray` -> `[R, G_even, G_odd, B]`.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_vegameta_rawzero_Native_wbGains<'caller>(
+    mut unowned: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    ints_arr: JIntArray<'caller>,
+    doubles_arr: JDoubleArray<'caller>,
+    kelvin: jni::sys::jdouble,
+) -> JFloatArray<'caller> {
+    unowned
+        .with_env(|env| -> Result<_, BridgeError> {
+            let g = wb_gains(&read_ints(env, &ints_arr)?, &read_doubles(env, &doubles_arr)?, kelvin)?;
+            let out = JFloatArray::new(env, 4)?;
+            out.set_region(env, 0, &g)?;
+            Ok(out)
+        })
+        .resolve::<jni::errors::ThrowRuntimeExAndDefault>()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -225,6 +260,15 @@ mod tests {
         assert_eq!(m.color.cal1.camera_calibration, rawzero_core::color::IDENTITY);
         let m = build_meta(&i, &f, &d, Some(&shading), "Xiaomi").unwrap();
         assert_eq!(m.lens_shading.unwrap().gains.len(), 6);
+    }
+
+    #[test]
+    fn wb_gains_warm_light_boosts_blue() {
+        let (i, _, d) = arrays();
+        let warm = wb_gains(&i, &d, 2800.0).unwrap();
+        let cool = wb_gains(&i, &d, 7000.0).unwrap();
+        assert_eq!(warm[1], 1.0);
+        assert!(warm[3] > cool[3] && warm[0] < cool[0], "{warm:?} {cool:?}");
     }
 
     #[test]

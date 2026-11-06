@@ -1,0 +1,97 @@
+package dev.vegameta.rawzero.camera
+
+import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraMetadata
+import android.hardware.camera2.CaptureRequest
+import android.hardware.camera2.CaptureResult
+import android.hardware.camera2.params.ColorSpaceTransform
+import android.hardware.camera2.params.RggbChannelVector
+import dev.vegameta.rawzero.Native
+import kotlin.math.roundToInt
+
+/** Manual settings; null = auto. Everything is auto by default. */
+data class Controls(
+    /** Exposure compensation in AE steps (only meaningful while exposure is auto). */
+    val evSteps: Int = 0,
+    val exposureNs: Long? = null,
+    val iso: Int? = null,
+    /** Diopters (1 / meters); 0 = infinity. */
+    val focusDiopters: Float? = null,
+    val kelvin: Int? = null,
+) {
+    val exposureManual get() = exposureNs != null || iso != null
+}
+
+/** Per-lens option lists for the settings sliders. Index 0 of each list is "auto". */
+class LensOptions(val lens: Lens) {
+    private val ch = lens.chars
+    val evStep: Float = ch[CameraCharacteristics.CONTROL_AE_COMPENSATION_STEP]?.toFloat() ?: (1f / 3)
+    val evRange: IntRange = ch[CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE]?.let { it.lower..it.upper } ?: 0..0
+
+    private val expRange = ch[CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE]
+    val exposures: List<Long?> = listOf<Long?>(null) + listOf(
+        1.0 / 8000, 1.0 / 4000, 1.0 / 2000, 1.0 / 1000, 1.0 / 500, 1.0 / 250, 1.0 / 125, 1.0 / 60,
+        1.0 / 30, 1.0 / 15, 1.0 / 8, 1.0 / 4, 1.0 / 2, 1.0,
+    ).map { (it * 1e9).toLong() }.filter { expRange == null || it in expRange.lower..expRange.upper }
+
+    private val isoRange = ch[CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE]
+    val isos: List<Int?> = listOf<Int?>(null) + listOf(50, 100, 200, 400, 800, 1600, 3200, 6400, 12800)
+        .filter { isoRange == null || it in isoRange.lower..isoRange.upper }
+
+    /** Closest focus in diopters; 0 means fixed focus (front cameras). */
+    val minFocus: Float = ch[CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE] ?: 0f
+    val focusSteps = 40
+    val kelvins: List<Int?> = listOf<Int?>(null) + (2500..8000 step 250).toList()
+
+    fun focusAt(i: Int): Float? = if (i == 0) null else minFocus * (i - 1) / (focusSteps - 1)
+}
+
+fun formatExposure(ns: Long): String = if (ns >= 500_000_000L) "%.1f с".format(ns / 1e9) else "1/${(1e9 / ns).roundToInt()}"
+
+fun formatFocus(d: Float): String = if (d <= 0.001f) "∞" else if (1 / d >= 1) "%.1f м".format(1 / d) else "${(100 / d).roundToInt()} см"
+
+/**
+ * Applies [c] to a request. Manual exposure needs both time and ISO; the missing one is
+ * derived from the last auto-metered frame so brightness stays put (time x ISO constant).
+ * Manual WB sets COLOR_CORRECTION_GAINS from the sensor calibration at that temperature
+ * and keeps the last auto color transform for the ISP preview.
+ */
+fun CaptureRequest.Builder.applyControls(lens: Lens, c: Controls, lastAutoAe: CaptureResult?, lastAutoAwb: CaptureResult?) {
+    val ch = lens.chars
+    set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
+    if (c.exposureManual) {
+        val meteredExp = lastAutoAe?.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: 10_000_000L
+        val meteredIso = lastAutoAe?.get(CaptureResult.SENSOR_SENSITIVITY) ?: 400
+        val isoRange = ch[CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE]
+        val expRange = ch[CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE]
+        val exp = c.exposureNs ?: (meteredExp.toDouble() * meteredIso / c.iso!!).toLong()
+        val iso = c.iso ?: (meteredIso.toDouble() * meteredExp / exp).roundToInt()
+        set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF)
+        set(CaptureRequest.SENSOR_EXPOSURE_TIME, expRange?.clamp(exp) ?: exp)
+        set(CaptureRequest.SENSOR_SENSITIVITY, isoRange?.clamp(iso) ?: iso)
+    } else {
+        set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON)
+        set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, c.evSteps)
+    }
+
+    val af = ch[CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES] ?: intArrayOf()
+    if (c.focusDiopters != null) {
+        set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_OFF)
+        set(CaptureRequest.LENS_FOCUS_DISTANCE, c.focusDiopters)
+    } else if (CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE in af) {
+        set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+    }
+
+    if (c.kelvin != null) {
+        val g = Native.wbGainsFor(ch, c.kelvin.toDouble())
+        set(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_OFF)
+        set(CaptureRequest.COLOR_CORRECTION_MODE, CameraMetadata.COLOR_CORRECTION_MODE_TRANSFORM_MATRIX)
+        set(CaptureRequest.COLOR_CORRECTION_GAINS, RggbChannelVector(g[0], g[1], g[2], g[3]))
+        set(CaptureRequest.COLOR_CORRECTION_TRANSFORM,
+            lastAutoAwb?.get(CaptureResult.COLOR_CORRECTION_TRANSFORM) ?: identityTransform)
+    } else {
+        set(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_AUTO)
+    }
+}
+
+private val identityTransform = ColorSpaceTransform(intArrayOf(1, 1, 0, 1, 0, 1, 0, 1, 1, 1, 0, 1, 0, 1, 0, 1, 1, 1))

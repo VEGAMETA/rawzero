@@ -38,7 +38,7 @@ object ShotSaver {
             }
         }
 
-    private fun write(cr: ContentResolver, dir: String, file: String, mime: String, body: (OutputStream) -> Unit): String {
+    private fun write(cr: ContentResolver, dir: String, file: String, mime: String, body: (OutputStream) -> Unit): Uri {
         val values = ContentValues().apply {
             put(MediaStore.MediaColumns.DISPLAY_NAME, file)
             put(MediaStore.MediaColumns.MIME_TYPE, mime)
@@ -54,7 +54,18 @@ object ShotSaver {
             cr.delete(uri, null, null)
             throw e
         }
-        return "$dir/$file"
+        return uri
+    }
+
+    /** Newest photo of ours in the gallery (only files this install created are visible). */
+    fun latest(cr: ContentResolver): Uri? {
+        val collection = MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+        cr.query(
+            collection, arrayOf(MediaStore.MediaColumns._ID),
+            "${MediaStore.MediaColumns.RELATIVE_PATH} = ? AND ${MediaStore.MediaColumns.MIME_TYPE} = ?",
+            arrayOf("$DIR/", "image/jpeg"), "${MediaStore.MediaColumns.DATE_ADDED} DESC",
+        )?.use { c -> if (c.moveToFirst()) return android.content.ContentUris.withAppendedId(collection, c.getLong(0)) }
+        return null
     }
 
     fun exifOrientation(degrees: Int) = when ((degrees % 360 + 360) % 360) {

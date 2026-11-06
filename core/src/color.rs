@@ -181,6 +181,51 @@ fn normalize_forward(fm: &Mat3) -> Mat3 {
     std::array::from_fn(|i| fm[i].map(|v| v * want[i] / got[i]))
 }
 
+/// Chromaticity of a Planckian radiator, 1667..25000 K. Cubic approximation of
+/// B. Kang et al., "Design of advanced color temperature control system for HDTV
+/// applications", J. Korean Phys. Soc. 41 (2002).
+pub fn planckian_xy(kelvin: f64) -> [f64; 2] {
+    let t = kelvin.clamp(1667.0, 25000.0);
+    let (t2, t3) = (t * t, t * t * t);
+    let x = if t <= 4000.0 {
+        -0.266_123_9e9 / t3 - 0.234_358_9e6 / t2 + 0.877_695_6e3 / t + 0.179_910
+    } else {
+        -3.025_846_9e9 / t3 + 2.107_037_9e6 / t2 + 0.222_634_7e3 / t + 0.240_390
+    };
+    let y = if t <= 2222.0 {
+        -1.106_381_4 * x.powi(3) - 1.348_110_20 * x * x + 2.185_558_32 * x - 0.202_196_83
+    } else if t <= 4000.0 {
+        -0.954_947_6 * x.powi(3) - 1.374_185_93 * x * x + 2.091_370_15 * x - 0.167_488_67
+    } else {
+        3.081_758_0 * x.powi(3) - 5.873_386_70 * x * x + 3.751_129_97 * x - 0.370_014_83
+    };
+    [x, y]
+}
+
+/// Camera neutral (max 1) of a Planckian illuminant at `kelvin`: the inverse of the scene
+/// white search in `interpolate`, used for manual white balance
+/// (COLOR_CORRECTION_GAINS = 1 / neutral). DNG spec ch. 6: CameraNeutral = AB * CC * CM * XYZ.
+pub fn neutral_for_temperature(p: &ColorProfile, kelvin: f64) -> Result<[f64; 3], Error> {
+    let xyz = xy_to_xyz(planckian_xy(kelvin));
+    let (cm, cc) = match &p.cal2 {
+        None => (p.cal1.color_matrix, p.cal1.camera_calibration),
+        Some(c2) => {
+            let temp = |c: &Calibration| {
+                illuminant_temperature(c.illuminant)
+                    .ok_or_else(|| Error::Unsupported(format!("calibration illuminant {}", c.illuminant)))
+            };
+            let w = weight_cal1(kelvin, temp(&p.cal1)?, temp(c2)?);
+            (lerp_mat(&p.cal1.color_matrix, &c2.color_matrix, w), lerp_mat(&p.cal1.camera_calibration, &c2.camera_calibration, w))
+        }
+    };
+    let n = mul_vec(&mul(&diag(p.analog_balance), &mul(&cc, &cm)), xyz);
+    let max = n[0].max(n[1]).max(n[2]);
+    if !(max > 0.0) || n.iter().any(|v| *v <= 0.0) {
+        return Err(Error::InvalidInput(format!("neutral {n:?} at {kelvin} K")));
+    }
+    Ok(n.map(|v| v / max))
+}
+
 /// White-balanced camera RGB -> XYZ(D50). `neutral` is the camera neutral with max 1.
 pub fn camera_to_xyz_d50(p: &ColorProfile, neutral: [f64; 3]) -> Result<Mat3, Error> {
     let it = interpolate(p, neutral)?;
@@ -286,6 +331,27 @@ mod tests {
         let it = interpolate(&p, n).unwrap();
         let t = cct_mccamy(it.white_xy);
         assert!((t - 6504.0).abs() < 10.0, "{t}");
+    }
+
+    #[test]
+    fn planckian_locus_reference() {
+        // CIE: 2856 K Planckian = illuminant A (0.44757, 0.40745).
+        let a = planckian_xy(2856.0);
+        assert!((a[0] - 0.44757).abs() < 1e-3 && (a[1] - 0.40745).abs() < 1e-3, "{a:?}");
+        for t in [2500.0, 3500.0, 5000.0, 6500.0] {
+            assert!((cct_mccamy(planckian_xy(t)) - t).abs() < 0.01 * t);
+        }
+    }
+
+    #[test]
+    fn temperature_roundtrip_through_neutral() {
+        // Manual WB at T, then the auto path must find the same temperature back.
+        let p = profile(false);
+        for t in [3000.0, 4500.0, 6000.0] {
+            let n = neutral_for_temperature(&p, t).unwrap();
+            let found = cct_mccamy(interpolate(&p, n).unwrap().white_xy);
+            assert!((found - t).abs() < 0.02 * t, "{t} -> {found}");
+        }
     }
 
     #[test]

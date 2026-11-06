@@ -18,6 +18,7 @@ import android.view.Surface
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.withTimeout
 import java.util.concurrent.Executor
+import kotlin.math.abs
 
 /** RAW frame with the ISP JPEG of the same request and the full capture result. */
 class Shot(val lens: Lens, val raw: Image, val ispJpeg: ByteArray, val result: TotalCaptureResult, val jpegOrientation: Int) :
@@ -26,10 +27,9 @@ class Shot(val lens: Lens, val raw: Image, val ispJpeg: ByteArray, val result: T
 }
 
 /**
- * One open camera: ISP preview on a PRIVATE surface, plus RAW_SENSOR (max) and JPEG (max)
- * readers used only on shutter. PRIV preview + JPEG max + RAW max is a guaranteed stream
- * combination for RAW-capable devices (CameraDevice#createCaptureSession tables).
- * 3A stays automatic; no RAW work happens while previewing.
+ * One open camera: ISP preview on a PRIVATE surface, plus RAW_SENSOR (max) and JPEG
+ * (<= RAW size) readers used only on shutter. PRIV preview + JPEG + RAW is a guaranteed
+ * stream combination for RAW-capable devices. No RAW work happens while previewing.
  */
 class CaptureSession private constructor(
     val lens: Lens,
@@ -37,26 +37,41 @@ class CaptureSession private constructor(
     private val handler: Handler,
     private val device: CameraDevice,
     private val session: CameraCaptureSession,
+    private val preview: Surface,
     private val rawReader: ImageReader,
     private val jpegReader: ImageReader,
 ) : AutoCloseable {
 
+    @Volatile var controls = Controls()
+        private set
+
+    /** Latest preview results metered with auto AE / auto AWB: references for manual modes. */
+    @Volatile private var lastAutoAe: TotalCaptureResult? = null
+    @Volatile private var lastAutoAwb: TotalCaptureResult? = null
+
+    private val previewCallback = object : CameraCaptureSession.CaptureCallback() {
+        override fun onCaptureCompleted(s: CameraCaptureSession, r: CaptureRequest, res: TotalCaptureResult) {
+            if (r.get(CaptureRequest.CONTROL_AE_MODE) != CameraMetadata.CONTROL_AE_MODE_OFF) lastAutoAe = res
+            if (r.get(CaptureRequest.CONTROL_AWB_MODE) != CameraMetadata.CONTROL_AWB_MODE_OFF) lastAutoAwb = res
+        }
+    }
+
     companion object {
+        fun rawSize(lens: Lens): Size =
+            lens.chars[CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP]!!
+                .getOutputSizes(ImageFormat.RAW_SENSOR).maxBy { it.width.toLong() * it.height }
+
         /** Largest preview size with the sensor aspect, capped for ISP load. */
         fun previewSize(lens: Lens): Size {
             val map = lens.chars[CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP]!!
             val raw = rawSize(lens)
             val aspect = raw.width.toDouble() / raw.height
             return map.getOutputSizes(android.graphics.SurfaceTexture::class.java)
-                .filter { it.width <= 1920 && it.height <= 1440 && kotlin.math.abs(it.width.toDouble() / it.height - aspect) < 0.02 }
+                .filter { it.width <= 1920 && it.height <= 1440 && abs(it.width.toDouble() / it.height - aspect) < 0.02 }
                 .maxByOrNull { it.width.toLong() * it.height } ?: Size(1440, 1080)
         }
 
-        fun rawSize(lens: Lens): Size =
-            lens.chars[CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP]!!
-                .getOutputSizes(ImageFormat.RAW_SENSOR).maxBy { it.width.toLong() * it.height }
-
-        suspend fun open(cm: CameraManager, lens: Lens, preview: Surface): CaptureSession {
+        suspend fun open(cm: CameraManager, lens: Lens, preview: Surface, controls: Controls): CaptureSession {
             val thread = HandlerThread("camera-${lens.id}").apply { start() }
             val handler = Handler(thread.looper)
             val exec = Executor { handler.post(it) }
@@ -66,22 +81,18 @@ class CaptureSession private constructor(
             // the binned RAW is not a guaranteed combination (session hangs on Xiaomi).
             val jpeg = map.getOutputSizes(ImageFormat.JPEG)
                 .filter { it.width <= raw.width && it.height <= raw.height &&
-                    kotlin.math.abs(it.width.toDouble() / it.height - raw.width.toDouble() / raw.height) < 0.02 }
+                    abs(it.width.toDouble() / it.height - raw.width.toDouble() / raw.height) < 0.02 }
                 .maxByOrNull { it.width.toLong() * it.height }
-                ?: map.getOutputSizes(ImageFormat.JPEG).minBy { kotlin.math.abs(it.width - raw.width) }
+                ?: map.getOutputSizes(ImageFormat.JPEG).minBy { abs(it.width - raw.width) }
             val rawReader = ImageReader.newInstance(raw.width, raw.height, ImageFormat.RAW_SENSOR, 2)
             val jpegReader = ImageReader.newInstance(jpeg.width, jpeg.height, ImageFormat.JPEG, 2)
             var device: CameraDevice? = null
             try {
                 device = withTimeout(5_000) { cm.openAwait(lens.id, handler) }
-                val session = withTimeout(5_000) { device.createSessionAwait(
-                    listOf(preview, rawReader.surface, jpegReader.surface).map { OutputConfiguration(it) }, exec) }
-                val req = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
-                    addTarget(preview)
-                    setAuto(lens.chars)
-                }.build()
-                session.setRepeatingRequest(req, null, handler)
-                return CaptureSession(lens, thread, handler, device, session, rawReader, jpegReader)
+                val session = withTimeout(5_000) {
+                    device.createSessionAwait(listOf(preview, rawReader.surface, jpegReader.surface).map { OutputConfiguration(it) }, exec)
+                }
+                return CaptureSession(lens, thread, handler, device, session, preview, rawReader, jpegReader).also { it.setControls(controls) }
             } catch (e: Throwable) {
                 device?.close()
                 rawReader.close()
@@ -90,16 +101,16 @@ class CaptureSession private constructor(
                 throw e
             }
         }
+    }
 
-        private fun CaptureRequest.Builder.setAuto(ch: CameraCharacteristics) {
-            set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
-            set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON)
-            set(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_AUTO)
-            val af = ch[CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES] ?: intArrayOf()
-            if (CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE in af) {
-                set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
-            }
-        }
+    /** Re-issues the repeating preview request with new settings. */
+    fun setControls(c: Controls) {
+        controls = c
+        val req = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
+            addTarget(preview)
+            applyControls(lens, c, lastAutoAe, lastAutoAwb)
+        }.build()
+        session.setRepeatingRequest(req, previewCallback, handler)
     }
 
     /** One still request writing both RAW and the ISP JPEG; the JPEG is the look reference. */
@@ -118,7 +129,7 @@ class CaptureSession private constructor(
         val still = device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
             addTarget(rawReader.surface)
             addTarget(jpegReader.surface)
-            setAuto(lens.chars)
+            applyControls(lens, controls, lastAutoAe, lastAutoAwb)
             set(CaptureRequest.STATISTICS_LENS_SHADING_MAP_MODE, CameraMetadata.STATISTICS_LENS_SHADING_MAP_MODE_ON)
             set(CaptureRequest.JPEG_ORIENTATION, jpegOrientation)
             set(CaptureRequest.JPEG_QUALITY, 95.toByte())

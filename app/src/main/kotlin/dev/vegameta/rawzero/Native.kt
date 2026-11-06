@@ -20,6 +20,27 @@ object Native {
         ints: IntArray, floats: FloatArray, doubles: DoubleArray, shading: FloatArray?, make: String,
     ): ByteArray
 
+    @JvmStatic
+    external fun wbGains(ints: IntArray, doubles: DoubleArray, kelvin: Double): FloatArray
+
+    /** COLOR_CORRECTION_GAINS for a Planckian white at [kelvin], from the sensor's color calibration. */
+    fun wbGainsFor(ch: CameraCharacteristics, kelvin: Double): FloatArray {
+        val ints = IntArray(INTS_LEN)
+        ints[ILLUMINANT1] = ch[CameraCharacteristics.SENSOR_REFERENCE_ILLUMINANT1] ?: 21
+        ints[ILLUMINANT2] = ch[CameraCharacteristics.SENSOR_REFERENCE_ILLUMINANT2]?.toInt() ?: 0
+        return wbGains(ints, colorMatrices(ch), kelvin)
+    }
+
+    private fun colorMatrices(ch: CameraCharacteristics): DoubleArray {
+        val doubles = DoubleArray(54) { Double.NaN }
+        listOf(
+            ch[CameraCharacteristics.SENSOR_COLOR_TRANSFORM1], ch[CameraCharacteristics.SENSOR_COLOR_TRANSFORM2],
+            ch[CameraCharacteristics.SENSOR_FORWARD_MATRIX1], ch[CameraCharacteristics.SENSOR_FORWARD_MATRIX2],
+            ch[CameraCharacteristics.SENSOR_CALIBRATION_TRANSFORM1], ch[CameraCharacteristics.SENSOR_CALIBRATION_TRANSFORM2],
+        ).forEachIndexed { m, t -> t?.let { put(doubles, m, it) } }
+        return doubles
+    }
+
     // ints layout
     private const val CFA = 0
     private const val ORIENTATION = 1
@@ -80,13 +101,7 @@ object Native {
         val g = r[CaptureResult.COLOR_CORRECTION_GAINS] ?: error("no COLOR_CORRECTION_GAINS")
         floats[5] = g.red; floats[6] = g.greenEven; floats[7] = g.greenOdd; floats[8] = g.blue
 
-        val doubles = DoubleArray(54) { Double.NaN }
-        listOf(
-            ch[CameraCharacteristics.SENSOR_COLOR_TRANSFORM1], ch[CameraCharacteristics.SENSOR_COLOR_TRANSFORM2],
-            ch[CameraCharacteristics.SENSOR_FORWARD_MATRIX1], ch[CameraCharacteristics.SENSOR_FORWARD_MATRIX2],
-            ch[CameraCharacteristics.SENSOR_CALIBRATION_TRANSFORM1], ch[CameraCharacteristics.SENSOR_CALIBRATION_TRANSFORM2],
-        ).forEachIndexed { m, t -> t?.let { put(doubles, m, it) } }
-
+        val doubles = colorMatrices(ch)
         return processRaw16(plane.buffer, raw.width, raw.height, plane.rowStride, ints, floats, doubles, shading, Build.MANUFACTURER)
     }
 
