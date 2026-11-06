@@ -95,8 +95,56 @@ object Native {
     fun process(raw: Image, ch: CameraCharacteristics, r: CaptureResult, exifOrientation: Int,
                 mirrorDegrees: Int? = null, reference: Triple<ByteArray, Int, Int>? = null,
                 classic: Boolean = false, refRotateCw: Int = 0, refMirror: Boolean = false, quality: Int = 92): ByteArray {
-        require(raw.format == ImageFormat.RAW_SENSOR) { "format ${raw.format}" }
+        val a = arrays(raw, ch, r, exifOrientation, mirrorDegrees, classic, refRotateCw, refMirror, quality)
         val plane = raw.planes[0]
+        return processRaw16(plane.buffer, raw.width, raw.height, plane.rowStride, a.ints, a.floats, a.doubles, a.shading, Build.MANUFACTURER,
+            reference?.first, reference?.second ?: 0, reference?.third ?: 0)
+    }
+
+    @JvmStatic external fun nightBegin(raw: java.nio.ByteBuffer, width: Int, height: Int, rowStride: Int,
+        ints: IntArray, floats: FloatArray, doubles: DoubleArray, shading: FloatArray?, make: String): Long
+    @JvmStatic external fun nightAdd(handle: Long, raw: java.nio.ByteBuffer, width: Int, height: Int, rowStride: Int): Int
+    @JvmStatic external fun nightFinish(handle: Long, reference: ByteArray?, refWidth: Int, refHeight: Int): ByteArray
+    @JvmStatic external fun nightCancel(handle: Long)
+
+    /**
+     * Night burst (HDR+-style align + merge in Rust, then Classic). Frames are fed as they
+     * arrive and closed by the caller right after [add]; only the reference and accumulators
+     * live in native memory.
+     */
+    class NightBurst(first: Image, ch: CameraCharacteristics, r: CaptureResult, exifOrientation: Int,
+                     mirrorDegrees: Int?, refRotateCw: Int, refMirror: Boolean) : AutoCloseable {
+        private var handle: Long
+
+        init {
+            val a = arrays(first, ch, r, exifOrientation, mirrorDegrees, true, refRotateCw, refMirror, 92)
+            val p = first.planes[0]
+            handle = nightBegin(p.buffer, first.width, first.height, p.rowStride, a.ints, a.floats, a.doubles, a.shading, Build.MANUFACTURER)
+        }
+
+        fun add(frame: Image): Int {
+            val p = frame.planes[0]
+            return nightAdd(handle, p.buffer, frame.width, frame.height, p.rowStride)
+        }
+
+        fun finish(reference: Triple<ByteArray, Int, Int>?): ByteArray {
+            val h = handle
+            handle = 0
+            return nightFinish(h, reference?.first, reference?.second ?: 0, reference?.third ?: 0)
+        }
+
+        override fun close() {
+            if (handle != 0L) nightCancel(handle)
+            handle = 0
+        }
+    }
+
+    private class Arrays(val ints: IntArray, val floats: FloatArray, val doubles: DoubleArray, val shading: FloatArray?)
+
+    /** FrameMeta as flat arrays (layout in jni-bridge/src/lib.rs). */
+    private fun arrays(raw: Image, ch: CameraCharacteristics, r: CaptureResult, exifOrientation: Int, mirrorDegrees: Int?,
+                       classic: Boolean, refRotateCw: Int, refMirror: Boolean, quality: Int): Arrays {
+        require(raw.format == ImageFormat.RAW_SENSOR) { "format ${raw.format}" }
         val ints = IntArray(INTS_LEN)
         ints[CFA] = ch[CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT] ?: error("no CFA arrangement")
         ints[ORIENTATION] = exifOrientation
@@ -144,9 +192,7 @@ object Native {
         val g = r[CaptureResult.COLOR_CORRECTION_GAINS] ?: error("no COLOR_CORRECTION_GAINS")
         floats[5] = g.red; floats[6] = g.greenEven; floats[7] = g.greenOdd; floats[8] = g.blue
 
-        val doubles = colorMatrices(ch)
-        return processRaw16(plane.buffer, raw.width, raw.height, plane.rowStride, ints, floats, doubles, shading, Build.MANUFACTURER,
-            reference?.first, reference?.second ?: 0, reference?.third ?: 0)
+        return Arrays(ints, floats, colorMatrices(ch), shading)
     }
 
     private fun put(out: DoubleArray, m: Int, t: ColorSpaceTransform) {

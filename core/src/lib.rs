@@ -4,6 +4,7 @@
 //! 1 unpack, 2 levels, 3 lens shading, 4 hot pixels, 5 white balance, 6 demosaic,
 //! 7 color, 8 tone, 9 encode. No denoise, no sharpening, no local operators.
 
+pub mod burst;
 pub mod color;
 pub mod demosaic;
 pub mod denoise;
@@ -94,8 +95,23 @@ pub fn process_look(raw: &RawImage, meta: &FrameMeta, look: Look) -> Result<(Rgb
         clock = now;
     };
 
-    let mut m = levels::apply_levels(raw, meta);
+    let m = levels::apply_levels(raw, meta);
     lap("levels", &mut t);
+    let (out, rest) = process_mosaic(m, meta, look)?;
+    t.extend(rest);
+    Ok((out, t))
+}
+
+/// Steps 3..8 on a normalized mosaic (after levels): a single frame or a merged burst.
+pub fn process_mosaic(mut m: Mosaic, meta: &FrameMeta, look: Look) -> Result<(Rgb8Image, Timings), Error> {
+    meta.validate()?;
+    let mut t = Timings::new();
+    let mut clock = Instant::now();
+    let mut lap = |name: &'static str, t: &mut Timings| {
+        let now = Instant::now();
+        t.push((name, now - clock));
+        clock = now;
+    };
     // Noise reduction on stationary-noise data: after levels, before shading gains and WB.
     if matches!(look, Look::Classic(_)) {
         if let Some(nm) = denoise::estimate_noise(&m, meta.cfa) {

@@ -225,7 +225,7 @@ fn wht8(v: &mut [f32; 8]) {
     }
 }
 
-fn wht8x8(b: &mut [[f32; 8]; 8]) {
+pub(crate) fn wht8x8(b: &mut [[f32; 8]; 8]) {
     for row in b.iter_mut() {
         wht8(row);
     }
@@ -242,7 +242,7 @@ fn wht8x8(b: &mut [[f32; 8]; 8]) {
 }
 
 /// 8-point Kaiser window, w(n) = I0(beta sqrt(1 - (2n/(N-1) - 1)^2)) / I0(beta).
-fn kaiser8(beta: f32) -> [f32; 8] {
+pub(crate) fn kaiser8(beta: f32) -> [f32; 8] {
     let i0 = |x: f32| {
         // Series for the modified Bessel function of order 0.
         let (mut sum, mut term) = (1.0f32, 1.0f32);

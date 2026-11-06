@@ -188,53 +188,167 @@ pub extern "system" fn Java_dev_vegameta_rawzero_Native_processRaw16<'caller>(
 ) -> jni::objects::JByteArray<'caller> {
     unowned
         .with_env(|env| -> Result<_, BridgeError> {
-            let (w, h, stride) = (width as usize, height as usize, row_stride as usize);
-            let addr = env.get_direct_buffer_address(&raw)?;
-            let cap = env.get_direct_buffer_capacity(&raw)?;
-            if addr.is_null() || cap < (h.saturating_sub(1)) * stride + w * 2 {
-                return Err(BridgeError::Input(format!("raw buffer {cap} bytes for {w}x{h} stride {stride}")));
-            }
-            // SAFETY: the direct buffer belongs to the android.media.Image the caller keeps open
-            // for the duration of this call; `cap` bytes are readable.
-            let bytes = unsafe { std::slice::from_raw_parts(addr as *const u8, cap) };
-            let shading = if shading_arr.is_null() { None } else { Some(read_floats(env, &shading_arr)?) };
-            let meta = build_meta(
-                &read_ints(env, &ints_arr)?,
-                &read_floats(env, &floats_arr)?,
-                &read_doubles(env, &doubles_arr)?,
-                shading.as_deref(),
-                &make.try_to_string(env)?,
-            )?;
-            let quality = read_ints(env, &ints_arr)?[ints::JPEG_QUALITY].clamp(1, 100) as u8;
-            let raw = rawzero_core::unpack::unpack_raw16(bytes, w, h, stride)?;
-            let reference = if reference_arr.is_null() {
-                None
-            } else {
-                let mut v = vec![0i8; reference_arr.len(env)?];
-                reference_arr.get_region(env, 0, &mut v)?;
-                let (rw, rh) = (ref_width as usize, ref_height as usize);
-                if v.len() != rw * rh * 3 {
-                    return Err(BridgeError::Input(format!("reference {} bytes for {rw}x{rh}", v.len())));
-                }
-                Some(rawzero_core::Rgb8Image { width: rw, height: rh, data: v.into_iter().map(|b| b as u8).collect() })
-            };
+            let raw = read_raw(env, &raw, width, height, row_stride)?;
             let iv = read_ints(env, &ints_arr)?;
-            let geometry = rawzero_core::look::RefGeometry { rotate_cw: iv[ints::REF_ROTATE_CW].rem_euclid(360) as u16, mirror: iv[ints::REF_MIRROR] != 0 };
-            let look = if iv[ints::MODE] == 1 {
-                rawzero_core::Look::Classic(reference.as_ref().map(|image| rawzero_core::look::Reference { image, geometry }))
-            } else {
-                rawzero_core::Look::Fixed
-            };
+            let meta = read_meta(env, &iv, &floats_arr, &doubles_arr, &shading_arr, &make)?;
+            let reference = read_reference(env, &reference_arr, ref_width, ref_height)?;
+            let look = look_for(&iv, reference.as_ref());
             let (img, _t) = rawzero_core::process_look(&raw, &meta, look)?;
-            let img = match read_ints(env, &ints_arr)?[ints::MIRROR] {
-                1 => rawzero_core::image::mirror(&img, rawzero_core::image::Mirror::Columns),
-                2 => rawzero_core::image::mirror(&img, rawzero_core::image::Mirror::Rows),
-                _ => img,
-            };
-            let jpeg = rawzero_core::encode::encode_jpeg(&img, quality, meta.orientation)?;
-            Ok(env.byte_array_from_slice(&jpeg)?)
+            Ok(env.byte_array_from_slice(&encode(img, &iv, &meta)?)?)
         })
         .resolve::<jni::errors::ThrowRuntimeExAndDefault>()
+}
+
+fn read_raw(env: &Env, raw: &JByteBuffer, width: jint, height: jint, row_stride: jint) -> Result<rawzero_core::RawImage, BridgeError> {
+    let (w, h, stride) = (width as usize, height as usize, row_stride as usize);
+    let addr = env.get_direct_buffer_address(raw)?;
+    let cap = env.get_direct_buffer_capacity(raw)?;
+    if addr.is_null() || cap < (h.saturating_sub(1)) * stride + w * 2 {
+        return Err(BridgeError::Input(format!("raw buffer {cap} bytes for {w}x{h} stride {stride}")));
+    }
+    // SAFETY: the direct buffer belongs to the android.media.Image the caller keeps open for
+    // the duration of this call; `cap` bytes are readable. Copied out before returning.
+    let bytes = unsafe { std::slice::from_raw_parts(addr as *const u8, cap) };
+    Ok(rawzero_core::unpack::unpack_raw16(bytes, w, h, stride)?)
+}
+
+fn read_meta(env: &Env, iv: &[i32], floats: &JFloatArray, doubles: &JDoubleArray, shading: &JFloatArray, make: &JString) -> Result<FrameMeta, BridgeError> {
+    let shading = if shading.is_null() { None } else { Some(read_floats(env, shading)?) };
+    build_meta(iv, &read_floats(env, floats)?, &read_doubles(env, doubles)?, shading.as_deref(), &make.try_to_string(env)?)
+}
+
+fn read_reference(env: &Env, arr: &jni::objects::JByteArray, rw: jint, rh: jint) -> Result<Option<rawzero_core::Rgb8Image>, BridgeError> {
+    if arr.is_null() {
+        return Ok(None);
+    }
+    let mut v = vec![0i8; arr.len(env)?];
+    arr.get_region(env, 0, &mut v)?;
+    let (rw, rh) = (rw as usize, rh as usize);
+    if v.len() != rw * rh * 3 {
+        return Err(BridgeError::Input(format!("reference {} bytes for {rw}x{rh}", v.len())));
+    }
+    Ok(Some(rawzero_core::Rgb8Image { width: rw, height: rh, data: v.into_iter().map(|b| b as u8).collect() }))
+}
+
+fn look_for<'a>(iv: &[i32], reference: Option<&'a rawzero_core::Rgb8Image>) -> rawzero_core::Look<'a> {
+    let geometry = rawzero_core::look::RefGeometry { rotate_cw: iv[ints::REF_ROTATE_CW].rem_euclid(360) as u16, mirror: iv[ints::REF_MIRROR] != 0 };
+    if iv[ints::MODE] == 1 {
+        rawzero_core::Look::Classic(reference.map(|image| rawzero_core::look::Reference { image, geometry }))
+    } else {
+        rawzero_core::Look::Fixed
+    }
+}
+
+/// Selfie mirror + JPEG with EXIF orientation.
+fn encode(img: rawzero_core::Rgb8Image, iv: &[i32], meta: &FrameMeta) -> Result<Vec<u8>, BridgeError> {
+    let img = match iv[ints::MIRROR] {
+        1 => rawzero_core::image::mirror(&img, rawzero_core::image::Mirror::Columns),
+        2 => rawzero_core::image::mirror(&img, rawzero_core::image::Mirror::Rows),
+        _ => img,
+    };
+    let quality = iv[ints::JPEG_QUALITY].clamp(1, 100) as u8;
+    Ok(rawzero_core::encode::encode_jpeg(&img, quality, meta.orientation)?)
+}
+
+/// Night burst in progress: the HDR+ merger plus the first frame's metadata arrays.
+struct Night {
+    merger: rawzero_core::burst::BurstMerger,
+    iv: Vec<i32>,
+}
+
+/// `Native.nightBegin(raw, w, h, stride, ints, floats, doubles, shading, make): Long` - starts
+/// a burst with its reference frame. The handle must reach nightFinish or nightCancel.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub extern "system" fn Java_dev_vegameta_rawzero_Native_nightBegin<'caller>(
+    mut unowned: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    raw: JByteBuffer<'caller>,
+    width: jint,
+    height: jint,
+    row_stride: jint,
+    ints_arr: JIntArray<'caller>,
+    floats_arr: JFloatArray<'caller>,
+    doubles_arr: JDoubleArray<'caller>,
+    shading_arr: JFloatArray<'caller>,
+    make: JString<'caller>,
+) -> jni::sys::jlong {
+    unowned
+        .with_env(|env| -> Result<_, BridgeError> {
+            let raw = read_raw(env, &raw, width, height, row_stride)?;
+            let iv = read_ints(env, &ints_arr)?;
+            let meta = read_meta(env, &iv, &floats_arr, &doubles_arr, &shading_arr, &make)?;
+            let merger = rawzero_core::burst::BurstMerger::new(&raw, &meta)?;
+            Ok(Box::into_raw(Box::new(Night { merger, iv })) as jni::sys::jlong)
+        })
+        .resolve::<jni::errors::ThrowRuntimeExAndDefault>()
+}
+
+/// `Native.nightAdd(handle, raw, w, h, stride): Int` - aligns and merges one more frame.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_vegameta_rawzero_Native_nightAdd<'caller>(
+    mut unowned: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    handle: jni::sys::jlong,
+    raw: JByteBuffer<'caller>,
+    width: jint,
+    height: jint,
+    row_stride: jint,
+) -> jint {
+    unowned
+        .with_env(|env| -> Result<_, BridgeError> {
+            if handle == 0 {
+                return Err(BridgeError::Input("null night handle".into()));
+            }
+            // SAFETY: handle came from nightBegin and is not yet finished or cancelled; Kotlin
+            // uses it from one coroutine at a time.
+            let night = unsafe { &mut *(handle as *mut Night) };
+            let raw = read_raw(env, &raw, width, height, row_stride)?;
+            night.merger.add(&raw)?;
+            Ok(night.merger.frames() as jint)
+        })
+        .resolve::<jni::errors::ThrowRuntimeExAndDefault>()
+}
+
+/// `Native.nightFinish(handle, reference, refW, refH): ByteArray` - merged frame through the
+/// Classic pipeline; frees the handle.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_vegameta_rawzero_Native_nightFinish<'caller>(
+    mut unowned: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    handle: jni::sys::jlong,
+    reference_arr: jni::objects::JByteArray<'caller>,
+    ref_width: jint,
+    ref_height: jint,
+) -> jni::objects::JByteArray<'caller> {
+    unowned
+        .with_env(|env| -> Result<_, BridgeError> {
+            if handle == 0 {
+                return Err(BridgeError::Input("null night handle".into()));
+            }
+            // SAFETY: as in nightAdd; ownership returns to Rust and is dropped here.
+            let night = unsafe { Box::from_raw(handle as *mut Night) };
+            let reference = read_reference(env, &reference_arr, ref_width, ref_height)?;
+            let mut iv = night.iv.clone();
+            iv[ints::MODE] = 1; // Night always finishes with the Classic engine.
+            let (mosaic, meta) = night.merger.finish();
+            let (img, _t) = rawzero_core::process_mosaic(mosaic, &meta, look_for(&iv, reference.as_ref()))?;
+            Ok(env.byte_array_from_slice(&encode(img, &iv, &meta)?)?)
+        })
+        .resolve::<jni::errors::ThrowRuntimeExAndDefault>()
+}
+
+/// `Native.nightCancel(handle)` - frees an unfinished burst.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_vegameta_rawzero_Native_nightCancel<'caller>(
+    _unowned: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    handle: jni::sys::jlong,
+) {
+    if handle != 0 {
+        // SAFETY: handle came from nightBegin and was not finished.
+        drop(unsafe { Box::from_raw(handle as *mut Night) });
+    }
 }
 
 /// `Native.wbGains(ints, doubles, kelvin): FloatArray` -> `[R, G_even, G_odd, B]`.

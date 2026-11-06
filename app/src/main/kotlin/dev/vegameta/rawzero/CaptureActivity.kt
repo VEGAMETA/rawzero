@@ -399,13 +399,13 @@ class CaptureActivity : Activity(), SurfaceHolder.Callback {
         val longExp = controls.exposureNs?.takeIf { it >= LONG_EXPOSURE_UI_NS }
         status.text = when {
             longExp != null -> "держите телефон неподвижно"
-            m == Mode.NIGHT -> "ночь: склейка кадров ещё не готова, снимаю один кадр…"
+            m == Mode.NIGHT -> "ночь: держите телефон неподвижно…"
             else -> "обработка…"
         }
         longExp?.let(::startExposureIndicator)
         scope.launch {
             try {
-                val (msg, uri, bmp) = cameraLock.withLock {
+                val (msg, uri, bmp) = if (m == Mode.NIGHT && s.lens.raw) cameraLock.withLock { night(s) } else cameraLock.withLock {
                     val shot = s.shoot(ShotSaver.jpegOrientation(s.lens.chars, deviceDegrees))
                     if (longExp != null) exposureDone()
                     shot.use { withContext(Dispatchers.Default) { process(it, m) } }
@@ -460,6 +460,43 @@ class CaptureActivity : Activity(), SurfaceHolder.Callback {
         ring.visibility = View.GONE
         countdown.visibility = View.GONE
         countdown.textSize = 56f
+    }
+
+    /**
+     * Night: an 8-frame RAW burst, each frame aligned and merged in Rust as it arrives (HDR+),
+     * then the Classic engine with the preview frame as look reference.
+     */
+    private suspend fun night(s: CaptureSession): Triple<String, Uri, Bitmap?> {
+        val orientation = ShotSaver.jpegOrientation(s.lens.chars, deviceDegrees)
+        val mirror = if (s.lens.front) orientation else null
+        val sensorRot = s.lens.chars[android.hardware.camera2.CameraCharacteristics.SENSOR_ORIENTATION] ?: 0
+        var burst: Native.NightBurst? = null
+        val t0 = System.nanoTime()
+        try {
+            s.shootNight(dev.vegameta.rawzero.camera.NIGHT_FRAMES, orientation) { k, img, res ->
+                withContext(Dispatchers.Default) {
+                    if (k == 0) {
+                        burst = Native.NightBurst(img, s.lens.chars, res!!, ShotSaver.exifOrientation(orientation), mirror, sensorRot, s.lens.front)
+                    } else {
+                        burst!!.add(img)
+                    }
+                }
+                withContext(Dispatchers.Main) {
+                    status.text = "ночь: кадр ${k + 1} из ${dev.vegameta.rawzero.camera.NIGHT_FRAMES}"
+                    ring.visibility = View.VISIBLE
+                    ring.progress = (k + 1f) / dev.vegameta.rawzero.camera.NIGHT_FRAMES
+                }
+            }
+            val preview = shutterFrame
+            val jpeg = withContext(Dispatchers.Default) { burst!!.finish(preview?.let(Native::referenceRgb)) }
+            val ms = (System.nanoTime() - t0) / 1_000_000
+            val name = "RZ_" + java.text.SimpleDateFormat("yyyyMMdd_HHmmss_SSS", java.util.Locale.US).format(java.util.Date()) + "_cam" + s.lens.id + "_night"
+            val uri = withContext(Dispatchers.IO) { ShotSaver.saveJpeg(contentResolver, ShotSaver.DIR, name, jpeg) }
+            Log.i(TAG, "saved $name night ${dev.vegameta.rawzero.camera.NIGHT_FRAMES} frames ${ms}ms")
+            return Triple("${s.lens.label}  ночь ${dev.vegameta.rawzero.camera.NIGHT_FRAMES} кадров  $ms мс", uri, thumbnail(jpeg, orientation))
+        } finally {
+            burst?.close()
+        }
     }
 
     /** Our pipeline -> gallery JPEG; RAW mode adds the DNG; dev pairs keep DNG + ISP JPEG. */

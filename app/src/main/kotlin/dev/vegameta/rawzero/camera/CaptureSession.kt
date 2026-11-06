@@ -23,6 +23,11 @@ import kotlinx.coroutines.withTimeout
 import java.util.concurrent.Executor
 import kotlin.math.abs
 
+/** Per-frame exposure cap for night bursts (hand-held). */
+const val NIGHT_MAX_EXPOSURE_NS = 125_000_000L
+/** Frames per night burst. */
+const val NIGHT_FRAMES = 8
+
 /**
  * One still: RAW frame (null for ISP-only lenses), the ISP JPEG of the same request (null
  * when the lens has no JPEG stream next to RAW), and the capture result of *this lens*
@@ -119,7 +124,7 @@ class CaptureSession private constructor(
          */
         fun readers(lens: Lens, withJpeg: Boolean): List<ImageReader> {
             val out = mutableListOf<ImageReader>()
-            if (lens.raw) rawSize(lens).let { out += ImageReader.newInstance(it.width, it.height, ImageFormat.RAW_SENSOR, 2) }
+            if (lens.raw) rawSize(lens).let { out += ImageReader.newInstance(it.width, it.height, ImageFormat.RAW_SENSOR, 3) }
             if (withJpeg) {
                 val sizes = map(lens).getOutputSizes(ImageFormat.JPEG)
                 val a = aspect(lens)
@@ -205,6 +210,78 @@ class CaptureSession private constructor(
             // Re-arm the preview so no still-only state (long exposure, vendor priority) lingers.
             runCatching { setControls(controls) }
             shot
+        }
+    }
+
+    /**
+     * Night burst: [frames] RAW-only stills with identical settings - the metered exposure,
+     * capped at [NIGHT_MAX_EXPOSURE_NS] per frame against hand shake with ISO making up the
+     * rest (the merge then averages the noise down); AWB locked and focus held so frames
+     * agree. [onFrame] gets each image in order (with the result for frame 0) and must not
+     * keep it: the reader is small and the HAL waits for free buffers.
+     */
+    suspend fun shootNight(frames: Int, jpegOrientation: Int, onFrame: suspend (Int, Image, CaptureResult?) -> Unit) {
+        val reader = rawReader ?: error("night mode needs RAW")
+        drain(reader)
+        val ae = lastAutoAe
+        val ch = lens.chars
+        val meteredExp = controls.exposureNs ?: ae?.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: 50_000_000L
+        val meteredIso = controls.iso ?: ae?.get(CaptureResult.SENSOR_SENSITIVITY) ?: 800
+        val expRange = ch[CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE]
+        val isoRange = ch[CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE]
+        val exp = minOf(meteredExp, NIGHT_MAX_EXPOSURE_NS).let { expRange?.clamp(it) ?: it }
+        val iso = (meteredIso.toDouble() * meteredExp / exp).toInt().let { isoRange?.clamp(it) ?: it }
+        val focus = ae?.get(CaptureResult.LENS_FOCUS_DISTANCE)
+        Log.i("RawZero", "night: $frames x ${exp / 1_000_000} ms ISO $iso (metered ${meteredExp / 1_000_000} ms ISO $meteredIso)")
+        val requests = (0 until frames).map {
+            device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
+                addTarget(reader.surface)
+                applyControls(lens, controls, lastAutoAe, lastAutoAwb, preview = false)
+                set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF)
+                set(CaptureRequest.SENSOR_EXPOSURE_TIME, exp)
+                set(CaptureRequest.SENSOR_SENSITIVITY, iso)
+                set(CaptureRequest.CONTROL_AWB_LOCK, true)
+                if (focus != null && (ch[CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE] ?: 0f) > 0f) {
+                    set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_OFF)
+                    set(CaptureRequest.LENS_FOCUS_DISTANCE, focus)
+                }
+                set(CaptureRequest.STATISTICS_LENS_SHADING_MAP_MODE, CameraMetadata.STATISTICS_LENS_SHADING_MAP_MODE_ON)
+            }.build()
+        }
+        // Back-pressure: the listener only signals; frames are acquired when the merge is ready
+        // for them, so at most maxImages buffers are held and the HAL waits for the rest.
+        val ready = kotlinx.coroutines.channels.Channel<Unit>(kotlinx.coroutines.channels.Channel.UNLIMITED)
+        val first = CompletableDeferred<TotalCaptureResult>()
+        reader.setOnImageAvailableListener({ ready.trySend(Unit) }, handler)
+        val budgetMs = 15_000L + frames * (exp / 1_000_000) * 3
+        try {
+            withTimeout(budgetMs) {
+                session.captureBurst(requests, object : CameraCaptureSession.CaptureCallback() {
+                    override fun onCaptureCompleted(s: CameraCaptureSession, r: CaptureRequest, res: TotalCaptureResult) {
+                        if (!first.isCompleted) first.complete(res)
+                    }
+                    override fun onCaptureFailed(s: CameraCaptureSession, r: CaptureRequest, f: android.hardware.camera2.CaptureFailure) {
+                        if (!first.isCompleted) first.completeExceptionally(IllegalStateException("burst capture failed, reason ${f.reason}"))
+                    }
+                }, handler)
+                for (k in 0 until frames) {
+                    ready.receive()
+                    val img = reader.acquireNextImage() ?: error("burst frame $k missing")
+                    try {
+                        val res: CaptureResult? = if (k == 0) {
+                            val total = first.await()
+                            lens.physicalId?.let { total.physicalCameraTotalResults[it] } ?: total
+                        } else null
+                        onFrame(k, img, res)
+                    } finally {
+                        img.close()
+                    }
+                }
+            }
+        } finally {
+            reader.setOnImageAvailableListener(null, null)
+            drain(reader)
+            runCatching { setControls(controls) }
         }
     }
 
