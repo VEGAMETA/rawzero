@@ -2,7 +2,6 @@ package dev.vegameta.rawzero.probe
 
 import android.content.Context
 import android.graphics.ImageFormat
-import android.hardware.camera2.CameraAccessException
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
@@ -13,24 +12,22 @@ import android.hardware.camera2.CaptureResult
 import android.hardware.camera2.DngCreator
 import android.hardware.camera2.TotalCaptureResult
 import android.hardware.camera2.params.OutputConfiguration
-import android.hardware.camera2.params.SessionConfiguration
 import android.media.Image
 import android.media.ImageReader
 import android.os.Handler
 import android.os.HandlerThread
 import android.util.Log
 import android.util.Size
+import dev.vegameta.rawzero.camera.createSessionAwait
+import dev.vegameta.rawzero.camera.openAwait
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import java.io.File
 import java.io.FileOutputStream
 import java.util.concurrent.Executor
-import kotlin.coroutines.resume
-import kotlin.coroutines.resumeWithException
 
 private const val TAG = "RawZeroProbe"
 private const val MAX_PROBE_ID = 127
@@ -151,11 +148,11 @@ class Probe(private val ctx: Context, private val out: File, private val ui: (St
         var device: CameraDevice? = null
         var session: CameraCaptureSession? = null
         try {
-            device = openCamera(id, handler)
+            device = cm.openAwait(id, handler)
             val outputs = listOf(rawReader, yuvReader).map { r ->
                 OutputConfiguration(r.surface).apply { physical?.let { setPhysicalCameraId(it) } }
             }
-            session = createSession(device, outputs, exec)
+            session = device.createSessionAwait(outputs, exec)
 
             // Let AE/AF/AWB converge on a small YUV stream; the RAW stream stays idle.
             val preview = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
@@ -219,43 +216,4 @@ class Probe(private val ctx: Context, private val out: File, private val ui: (St
         val zoom = r[CaptureResult.CONTROL_ZOOM_RATIO]
         return "iso=$iso exp=$exp nr=$nr hotPixel=$hp black=$black white=$white lsm=$lsm gains=$gains zoom=$zoom"
     }
-
-    private suspend fun openCamera(id: String, handler: Handler): CameraDevice =
-        suspendCancellableCoroutine { cont ->
-            try {
-                cm.openCamera(id, object : CameraDevice.StateCallback() {
-                    override fun onOpened(d: CameraDevice) {
-                        if (cont.isActive) cont.resume(d) else d.close()
-                    }
-                    override fun onDisconnected(d: CameraDevice) {
-                        d.close()
-                        if (cont.isActive) cont.resumeWithException(CameraAccessException(CameraAccessException.CAMERA_DISCONNECTED, "disconnected"))
-                    }
-                    override fun onError(d: CameraDevice, error: Int) {
-                        d.close()
-                        if (cont.isActive) cont.resumeWithException(IllegalStateException("open error $error"))
-                    }
-                }, handler)
-            } catch (e: Exception) {
-                if (cont.isActive) cont.resumeWithException(e)
-            }
-        }
-
-    private suspend fun createSession(device: CameraDevice, outputs: List<OutputConfiguration>, exec: Executor): CameraCaptureSession =
-        suspendCancellableCoroutine { cont ->
-            val cfg = SessionConfiguration(SessionConfiguration.SESSION_REGULAR, outputs, exec,
-                object : CameraCaptureSession.StateCallback() {
-                    override fun onConfigured(s: CameraCaptureSession) {
-                        if (cont.isActive) cont.resume(s) else s.close()
-                    }
-                    override fun onConfigureFailed(s: CameraCaptureSession) {
-                        if (cont.isActive) cont.resumeWithException(IllegalStateException("session configuration failed"))
-                    }
-                })
-            try {
-                device.createCaptureSession(cfg)
-            } catch (e: Exception) {
-                if (cont.isActive) cont.resumeWithException(e)
-            }
-        }
 }

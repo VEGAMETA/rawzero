@@ -5,10 +5,11 @@
     <uses-feature android:name="android.hardware.camera.any" android:required="true" />
 
     <application
-        android:label="RawZero probe"
-        android:theme="@android:style/Theme.DeviceDefault">
+        android:label="RawZero"
+        android:forceDarkAllowed="false"
+        android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
         <activity
-            android:name=".probe.ProbeActivity"
+            android:name=".CaptureActivity"
             android:exported="true"
             android:screenOrientation="portrait">
             <intent-filter>
@@ -16,5 +17,10 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <!-- Diagnostics, started via adb (see ProbeActivity docs). -->
+        <activity
+            android:name=".probe.ProbeActivity"
+            android:exported="true"
+            android:screenOrientation="portrait" />
     </application>
 </manifest>
