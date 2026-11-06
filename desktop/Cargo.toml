@@ -11,3 +11,4 @@ path = "src/main.rs"
 
 [dependencies]
 rawzero-core = { path = "../core" }
+zune-jpeg = "0.5.15"

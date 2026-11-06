@@ -161,8 +161,10 @@ fn read_doubles(env: &Env, a: &JDoubleArray) -> Result<Vec<f64>, BridgeError> {
     Ok(v)
 }
 
-/// `Native.processRaw16(raw, width, height, rowStride, ints, floats, doubles, shading, make): ByteArray`
-/// RAW_SENSOR plane -> Process Zero pipeline -> JPEG bytes. Throws RuntimeException on error.
+/// `Native.processRaw16(raw, width, height, rowStride, ints, floats, doubles, shading, make,
+/// reference, refWidth, refHeight): ByteArray`
+/// RAW_SENSOR plane -> pipeline -> JPEG bytes. `reference` (RGB8, may be null) selects the
+/// Classic look matched to the ISP output; null gives Process Zero. Throws RuntimeException.
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub extern "system" fn Java_dev_vegameta_rawzero_Native_processRaw16<'caller>(
@@ -177,6 +179,9 @@ pub extern "system" fn Java_dev_vegameta_rawzero_Native_processRaw16<'caller>(
     doubles_arr: JDoubleArray<'caller>,
     shading_arr: JFloatArray<'caller>,
     make: JString<'caller>,
+    reference_arr: jni::objects::JByteArray<'caller>,
+    ref_width: jint,
+    ref_height: jint,
 ) -> jni::objects::JByteArray<'caller> {
     unowned
         .with_env(|env| -> Result<_, BridgeError> {
@@ -199,7 +204,19 @@ pub extern "system" fn Java_dev_vegameta_rawzero_Native_processRaw16<'caller>(
             )?;
             let quality = read_ints(env, &ints_arr)?[ints::JPEG_QUALITY].clamp(1, 100) as u8;
             let raw = rawzero_core::unpack::unpack_raw16(bytes, w, h, stride)?;
-            let (img, _t) = rawzero_core::process(&raw, &meta)?;
+            let reference = if reference_arr.is_null() {
+                None
+            } else {
+                let mut v = vec![0i8; reference_arr.len(env)?];
+                reference_arr.get_region(env, 0, &mut v)?;
+                let (rw, rh) = (ref_width as usize, ref_height as usize);
+                if v.len() != rw * rh * 3 {
+                    return Err(BridgeError::Input(format!("reference {} bytes for {rw}x{rh}", v.len())));
+                }
+                Some(rawzero_core::Rgb8Image { width: rw, height: rh, data: v.into_iter().map(|b| b as u8).collect() })
+            };
+            let look = reference.as_ref().map_or(rawzero_core::Look::Fixed, rawzero_core::Look::MatchReference);
+            let (img, _t) = rawzero_core::process_look(&raw, &meta, look)?;
             let img = match read_ints(env, &ints_arr)?[ints::MIRROR] {
                 1 => rawzero_core::image::mirror(&img, rawzero_core::image::Mirror::Columns),
                 2 => rawzero_core::image::mirror(&img, rawzero_core::image::Mirror::Rows),

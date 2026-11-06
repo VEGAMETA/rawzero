@@ -307,9 +307,10 @@ class CaptureActivity : Activity(), SurfaceHolder.Callback {
             val wanted = intent.getStringExtra("lens")?.let { id -> lenses.firstOrNull { it.id == id } }
             if (lenses.isEmpty()) status.text = "RAW-камер не найдено"
             else select(wanted ?: lenses.firstOrNull { !it.front && it.eqMm in 20..30 } ?: lenses.first())
-            // Test presets after the lens is chosen: --el exp <ns> --ei iso <n> --ei kelvin <K>.
-            if (intent.hasExtra("exp") || intent.hasExtra("iso") || intent.hasExtra("kelvin")) {
+            // Test presets after the lens is chosen: --el exp <ns> --ei iso <n> --ei kelvin <K> --ei ev <steps>.
+            if (intent.hasExtra("exp") || intent.hasExtra("iso") || intent.hasExtra("kelvin") || intent.hasExtra("ev")) {
                 update(Controls(
+                    evSteps = intent.getIntExtra("ev", 0),
                     exposureNs = intent.getLongExtra("exp", 0L).takeIf { it > 0 },
                     iso = intent.getIntExtra("iso", 0).takeIf { it > 0 },
                     kelvin = intent.getIntExtra("kelvin", 0).takeIf { it > 0 },
@@ -434,7 +435,9 @@ class CaptureActivity : Activity(), SurfaceHolder.Callback {
         val t0 = System.nanoTime()
         // Front camera keeps the mirror the preview showed (owner decision).
         val mirror = if (shot.lens.front) shot.jpegOrientation else null
-        val jpeg = Native.process(shot.raw, shot.lens.chars, shot.result, ShotSaver.exifOrientation(shot.jpegOrientation), mirror)
+        // Classic / Night: tone matched to what the ISP (preview) showed; RAW mode: Process Zero.
+        val reference = if (m == Mode.RAW) null else Native.referenceRgb(shot.ispJpeg)
+        val jpeg = Native.process(shot.raw, shot.lens.chars, shot.result, ShotSaver.exifOrientation(shot.jpegOrientation), mirror, reference)
         val ms = (System.nanoTime() - t0) / 1_000_000
         val uri = ShotSaver.saveJpeg(contentResolver, ShotSaver.DIR, name, jpeg)
         if (m == Mode.RAW) ShotSaver.saveDng(contentResolver, ShotSaver.DIR_DNG, name, shot)

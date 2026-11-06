@@ -18,7 +18,27 @@ object Native {
     external fun processRaw16(
         raw: java.nio.ByteBuffer, width: Int, height: Int, rowStride: Int,
         ints: IntArray, floats: FloatArray, doubles: DoubleArray, shading: FloatArray?, make: String,
+        reference: ByteArray?, refWidth: Int, refHeight: Int,
     ): ByteArray
+
+    /**
+     * ISP JPEG of the same request, decoded at 1/4 size to RGB8: the look reference for
+     * Classic (only its brightness distribution is used, so the size does not matter).
+     */
+    fun referenceRgb(ispJpeg: ByteArray): Triple<ByteArray, Int, Int>? {
+        val bmp = android.graphics.BitmapFactory.decodeByteArray(ispJpeg, 0, ispJpeg.size,
+            android.graphics.BitmapFactory.Options().apply { inSampleSize = 4 }) ?: return null
+        val px = IntArray(bmp.width * bmp.height)
+        bmp.getPixels(px, 0, bmp.width, 0, 0, bmp.width, bmp.height)
+        val rgb = ByteArray(px.size * 3)
+        for (i in px.indices) {
+            val c = px[i]
+            rgb[3 * i] = (c shr 16).toByte()
+            rgb[3 * i + 1] = (c shr 8).toByte()
+            rgb[3 * i + 2] = c.toByte()
+        }
+        return Triple(rgb, bmp.width, bmp.height).also { bmp.recycle() }
+    }
 
     @JvmStatic
     external fun wbGains(ints: IntArray, doubles: DoubleArray, kelvin: Double): FloatArray
@@ -65,7 +85,7 @@ object Native {
      * displayed horizontal axis is the stored vertical one, so rows are reversed.
      */
     fun process(raw: Image, ch: CameraCharacteristics, r: CaptureResult, exifOrientation: Int,
-                mirrorDegrees: Int? = null, quality: Int = 92): ByteArray {
+                mirrorDegrees: Int? = null, reference: Triple<ByteArray, Int, Int>? = null, quality: Int = 92): ByteArray {
         require(raw.format == ImageFormat.RAW_SENSOR) { "format ${raw.format}" }
         val plane = raw.planes[0]
         val ints = IntArray(INTS_LEN)
@@ -113,7 +133,8 @@ object Native {
         floats[5] = g.red; floats[6] = g.greenEven; floats[7] = g.greenOdd; floats[8] = g.blue
 
         val doubles = colorMatrices(ch)
-        return processRaw16(plane.buffer, raw.width, raw.height, plane.rowStride, ints, floats, doubles, shading, Build.MANUFACTURER)
+        return processRaw16(plane.buffer, raw.width, raw.height, plane.rowStride, ints, floats, doubles, shading, Build.MANUFACTURER,
+            reference?.first, reference?.second ?: 0, reference?.third ?: 0)
     }
 
     private fun put(out: DoubleArray, m: Int, t: ColorSpaceTransform) {

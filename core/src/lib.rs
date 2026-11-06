@@ -10,6 +10,7 @@ pub mod encode;
 pub mod hotpixel;
 pub mod image;
 pub mod levels;
+pub mod look;
 pub mod meta;
 pub mod shading;
 pub mod tone;
@@ -46,8 +47,22 @@ impl std::error::Error for Error {}
 /// Wall time of each step, in pipeline order.
 pub type Timings = Vec<(&'static str, Duration)>;
 
-/// Steps 2..8 on an unpacked frame. Encoding is separate so callers choose the format.
+/// How step 8 turns linear RGB into display values.
+#[derive(Clone, Copy, Debug)]
+pub enum Look<'a> {
+    /// Process Zero: fixed global S-curve, then sRGB OETF.
+    Fixed,
+    /// Classic: global tone curve fitted to the ISP output of the same request (look.rs).
+    MatchReference(&'a Rgb8Image),
+}
+
+/// Steps 2..8 on an unpacked frame (Process Zero). Encoding is separate.
 pub fn process(raw: &RawImage, meta: &FrameMeta) -> Result<(Rgb8Image, Timings), Error> {
+    process_look(raw, meta, Look::Fixed)
+}
+
+/// Steps 2..8 with a selectable tone stage.
+pub fn process_look(raw: &RawImage, meta: &FrameMeta, look: Look) -> Result<(Rgb8Image, Timings), Error> {
     meta.validate()?;
     if raw.data.len() != raw.width * raw.height || raw.width < 2 || raw.height < 2 {
         return Err(Error::InvalidInput(format!("raw {}x{}", raw.width, raw.height)));
@@ -82,7 +97,14 @@ pub fn process(raw: &RawImage, meta: &FrameMeta) -> Result<(Rgb8Image, Timings),
     let cam_to_srgb = color::camera_to_srgb(&meta.color, wb::camera_neutral(meta))?;
     let rgb = color::apply_matrix(&rgb, &cam_to_srgb);
     lap("color", &mut t);
-    let out = tone::render_8bit(&rgb, &tone::build_lut());
+    let out = match look {
+        Look::Fixed => tone::render_8bit(&rgb, &tone::build_lut()),
+        Look::MatchReference(r) => {
+            let tm = look::ToneMap::fit(&rgb, r);
+            lap("tone_fit", &mut t);
+            look::render_matched(&rgb, &tm)
+        }
+    };
     lap("tone", &mut t);
     Ok((out, t))
 }

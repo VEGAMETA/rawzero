@@ -14,6 +14,7 @@ const USAGE: &str = "usage: rawzero <input.dng> [-o out.jpg] [-q quality] [--fix
   -q N               JPEG quality 1..100 (default 92)
   --fix-hot-pixels   run hot pixel suppression (DNG does not say whether the HAL did it)
   --no-shading       skip lens shading even if the DNG carries a GainMap
+  --ref ISP.jpg      Classic look: match the tone of this ISP JPEG of the same shot
   --info             print metadata and exit";
 
 struct Args {
@@ -23,11 +24,12 @@ struct Args {
     fix_hot: bool,
     no_shading: bool,
     info: bool,
+    reference: Option<PathBuf>,
 }
 
 fn parse_args() -> Result<Args, String> {
     let mut it = std::env::args().skip(1);
-    let mut a = Args { input: PathBuf::new(), output: None, quality: DEFAULT_QUALITY, fix_hot: false, no_shading: false, info: false };
+    let mut a = Args { input: PathBuf::new(), output: None, quality: DEFAULT_QUALITY, fix_hot: false, no_shading: false, info: false, reference: None };
     let mut input = None;
     while let Some(s) = it.next() {
         match s.as_str() {
@@ -35,6 +37,7 @@ fn parse_args() -> Result<Args, String> {
             "-q" => a.quality = it.next().and_then(|v| v.parse().ok()).ok_or("-q needs 1..100")?,
             "--fix-hot-pixels" => a.fix_hot = true,
             "--no-shading" => a.no_shading = true,
+            "--ref" => a.reference = Some(it.next().ok_or("--ref needs a path")?.into()),
             "--info" => a.info = true,
             "-h" | "--help" => return Err(USAGE.into()),
             _ if s.starts_with('-') => return Err(format!("unknown option {s}\n{USAGE}")),
@@ -83,7 +86,9 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
 
-    let (img, timings) = rawzero_core::process(&d.raw, &d.meta).map_err(|e| e.to_string())?;
+    let reference = args.reference.as_deref().map(read_jpeg).transpose()?;
+    let look = reference.as_ref().map_or(rawzero_core::Look::Fixed, rawzero_core::Look::MatchReference);
+    let (img, timings) = rawzero_core::process_look(&d.raw, &d.meta, look).map_err(|e| e.to_string())?;
     let t1 = Instant::now();
     let jpeg = encode_jpeg(&img, args.quality, d.meta.orientation).map_err(|e| e.to_string())?;
     let t_enc = t1.elapsed();
@@ -99,6 +104,18 @@ fn run() -> Result<(), String> {
     eprintln!("{line} | jpeg {:.0} | pipeline {total:.0} ms", ms(t_enc));
     eprintln!("wrote {} ({}x{}, {} KB)", out.display(), img.width, img.height, jpeg.len() / 1024);
     Ok(())
+}
+
+/// Decodes a baseline/progressive JPEG to 8-bit RGB (zune-jpeg; desktop only).
+fn read_jpeg(path: &std::path::Path) -> Result<rawzero_core::Rgb8Image, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut dec = zune_jpeg::JpegDecoder::new(std::io::Cursor::new(bytes));
+    let data = dec.decode().map_err(|e| format!("{}: {e:?}", path.display()))?;
+    let (width, height) = dec.dimensions().ok_or("no JPEG dimensions")?;
+    if data.len() != width * height * 3 {
+        return Err(format!("{}: expected RGB output, got {} bytes for {width}x{height}", path.display(), data.len()));
+    }
+    Ok(rawzero_core::Rgb8Image { width, height, data })
 }
 
 fn main() -> ExitCode {
