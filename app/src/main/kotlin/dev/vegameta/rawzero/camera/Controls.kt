@@ -23,7 +23,7 @@ data class Controls(
 }
 
 /** Longest exposure the preview runs at; longer manual exposures are simulated by ISO. */
-const val PREVIEW_MAX_EXPOSURE_NS = 66_666_666L
+const val PREVIEW_MAX_EXPOSURE_NS = 33_333_333L
 /** Longest shutter offered in the UI (each lens is further limited by its sensor). */
 const val UI_MAX_EXPOSURE_NS = 60_000_000_000L
 
@@ -98,6 +98,12 @@ fun CaptureRequest.Builder.applyControls(
 ) {
     val ch = lens.chars
     set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
+    // Qualcomm vendor tags are sticky in the HAL: a long-exposure still would keep the
+    // preview at that exposure. Every request resets them unless it sets them itself.
+    if (QcomExposure.max(ch) != null) {
+        set(QcomExposure.SELECT_PRIORITY, 0)
+        set(QcomExposure.VALUE, 0L)
+    }
     if (c.exposureManual) {
         val meteredExp = lastAutoAe?.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: 10_000_000L
         val meteredIso = lastAutoAe?.get(CaptureResult.SENSOR_SENSITIVITY) ?: 400

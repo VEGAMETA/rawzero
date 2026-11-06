@@ -49,10 +49,24 @@ class CaptureSession private constructor(
     @Volatile private var lastAutoAe: TotalCaptureResult? = null
     @Volatile private var lastAutoAwb: TotalCaptureResult? = null
 
+    private var fpsWindowStart = 0L
+    private var fpsFrames = 0
+
     private val previewCallback = object : CameraCaptureSession.CaptureCallback() {
         override fun onCaptureCompleted(s: CameraCaptureSession, r: CaptureRequest, res: TotalCaptureResult) {
             if (r.get(CaptureRequest.CONTROL_AE_MODE) != CameraMetadata.CONTROL_AE_MODE_OFF) lastAutoAe = res
             if (r.get(CaptureRequest.CONTROL_AWB_MODE) != CameraMetadata.CONTROL_AWB_MODE_OFF) lastAutoAwb = res
+            // Preview health in logcat: frame rate and exposure every ~3 s.
+            val now = System.nanoTime()
+            fpsFrames++
+            if (fpsWindowStart == 0L) fpsWindowStart = now
+            if (now - fpsWindowStart >= 3_000_000_000L) {
+                android.util.Log.i("RawZero", "preview %.1f fps, exp %s ms".format(
+                    fpsFrames * 1e9 / (now - fpsWindowStart),
+                    res.get(android.hardware.camera2.CaptureResult.SENSOR_EXPOSURE_TIME)?.div(1_000_000)))
+                fpsWindowStart = now
+                fpsFrames = 0
+            }
         }
     }
 
@@ -141,7 +155,10 @@ class CaptureSession private constructor(
             val result = session.captureAwait(still, handler)
             android.util.Log.i("RawZero", "capture took ${(System.nanoTime() - t0) / 1_000_000} ms, " +
                 "result exp ${result.get(android.hardware.camera2.CaptureResult.SENSOR_EXPOSURE_TIME)} iso ${result.get(android.hardware.camera2.CaptureResult.SENSOR_SENSITIVITY)}")
-            Shot(lens, rawImage.await(), jpegBytes.await(), result, jpegOrientation)
+            val shot = Shot(lens, rawImage.await(), jpegBytes.await(), result, jpegOrientation)
+            // Re-arm the preview so no still-only state (long exposure, vendor priority) lingers.
+            runCatching { setControls(controls) }
+            shot
         }
     }
 
