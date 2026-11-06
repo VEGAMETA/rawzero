@@ -89,6 +89,19 @@ pub struct LensShadingMap {
     pub gains: Vec<[f32; 4]>,
 }
 
+/// Whether the RAW must be shading-corrected with the delivered map.
+///
+/// Camera2 says to apply `STATISTICS_LENS_SHADING_CORRECTION_MAP` only when
+/// `SENSOR_INFO_LENS_SHADING_APPLIED == false`; AOSP DngCreator writes the map into
+/// OpcodeList2 regardless of the flag. Measured on white-wall flat fields
+/// (`tools/flatfield.py`, 2026-11-06): Samsung S21U reports `true` and its RAW is indeed
+/// corrected (applying the map over-brightens corners 1.2-1.5x); Xiaomi 14 reports `true`
+/// but its RAW has the full lens falloff (corners 0.12-0.2 of center), so the flag is
+/// ignored for Xiaomi.
+pub fn needs_lens_shading(make: &str, hal_says_applied: bool) -> bool {
+    !hal_says_applied || make.eq_ignore_ascii_case("xiaomi")
+}
+
 /// One calibration illuminant of the DNG / Camera2 color model.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Calibration {
@@ -174,6 +187,13 @@ mod tests {
         assert_eq!((0..4).map(|i| p.camera2_channel(i)).collect::<Vec<_>>(), [1, 0, 3, 2]);
         let p = CfaPattern::Bggr;
         assert_eq!((0..4).map(|i| p.camera2_channel(i)).collect::<Vec<_>>(), [3, 1, 2, 0]);
+    }
+
+    #[test]
+    fn shading_flag_policy() {
+        assert!(needs_lens_shading("samsung", false));
+        assert!(!needs_lens_shading("samsung", true));
+        assert!(needs_lens_shading("Xiaomi", true));
     }
 
     #[test]

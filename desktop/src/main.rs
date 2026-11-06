@@ -55,7 +55,11 @@ fn run() -> Result<(), String> {
 
     let m = &mut d.meta;
     m.hot_pixels_corrected = !args.fix_hot;
-    if args.no_shading {
+    // DNG does not carry SENSOR_INFO_LENS_SHADING_APPLIED. Camera2 DNGs of the measured
+    // devices: Samsung reports true (and is right), Xiaomi reports true (and is wrong);
+    // other files keep their GainMap.
+    let hal_applied = d.make.eq_ignore_ascii_case("samsung");
+    if args.no_shading || !rawzero_core::meta::needs_lens_shading(&d.make, hal_applied) {
         m.lens_shading = None;
     }
     eprintln!("{} {} | {}x{} {}-bit {:?}", d.make, d.model, d.raw.width, d.raw.height, d.bits, m.cfa);
