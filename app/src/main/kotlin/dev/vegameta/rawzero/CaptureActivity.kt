@@ -33,6 +33,8 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
 private const val TAG = "RawZero"
+private const val PREF_RAW = "save_dng"
+private const val PREF_DEV = "save_dev_pairs"
 
 /**
  * Capture tool (milestone 2): ISP preview, every discovered lens, shutter saves
@@ -92,7 +94,14 @@ class CaptureActivity : Activity(), SurfaceHolder.Callback {
         }
         bottom.addView(status, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
         bottom.addView(HorizontalScrollView(this).apply { addView(lensBar) }, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { topMargin = 16 })
-        bottom.addView(shutter, LinearLayout.LayoutParams(200, 200).apply { topMargin = 32 })
+        val shutterRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            addView(toggle("RAW", PREF_RAW, false), LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT))
+            addView(shutter, LinearLayout.LayoutParams(200, 200).apply { leftMargin = 64; rightMargin = 64 })
+            addView(toggle("dev", PREF_DEV, true), LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT))
+        }
+        bottom.addView(shutterRow, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { topMargin = 32 })
         root.addView(bottom, FrameLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT, Gravity.BOTTOM))
         // Keep controls clear of the status and navigation bars.
         root.setOnApplyWindowInsetsListener { v, insets ->
@@ -158,20 +167,53 @@ class CaptureActivity : Activity(), SurfaceHolder.Callback {
     private fun shoot() {
         val s = session ?: return
         shutter.isEnabled = false
+        status.text = "${s.lens.label}  обработка…"
         scope.launch {
             try {
-                val names = cameraLock.withLock {
+                val msg = cameraLock.withLock {
                     val shot = s.shoot(ShotSaver.jpegOrientation(s.lens.chars, deviceDegrees))
-                    shot.use { withContext(Dispatchers.IO) { ShotSaver.save(contentResolver, it) } to ShotSaver.summary(it.result) }
+                    shot.use { withContext(Dispatchers.Default) { process(it) } }
                 }
-                status.text = "${s.lens.label}  ${names.second}  сохранено"
-                Log.i(TAG, "saved ${names.first} ${names.second}")
+                status.text = msg
             } catch (e: Throwable) {
                 Log.e(TAG, "shoot", e)
                 status.text = "ошибка съёмки: ${e.message}"
             } finally {
                 shutter.isEnabled = true
             }
+        }
+    }
+
+    /** Our pipeline -> gallery JPEG; optional DNG; dev pairs (DNG + ISP JPEG) for look work. */
+    private fun process(shot: dev.vegameta.rawzero.camera.Shot): String {
+        val name = ShotSaver.baseName(shot)
+        val t0 = System.nanoTime()
+        val jpeg = Native.process(shot.raw, shot.lens.chars, shot.result, ShotSaver.exifOrientation(shot.jpegOrientation))
+        val ms = (System.nanoTime() - t0) / 1_000_000
+        val saved = mutableListOf(ShotSaver.saveJpeg(contentResolver, ShotSaver.DIR, name, jpeg))
+        if (prefs.getBoolean(PREF_DEV, true)) {
+            saved += ShotSaver.saveDng(contentResolver, ShotSaver.DIR_DEV, name, shot)
+            saved += ShotSaver.saveJpeg(contentResolver, ShotSaver.DIR_DEV, name + "_isp", shot.ispJpeg)
+        } else if (prefs.getBoolean(PREF_RAW, false)) {
+            saved += ShotSaver.saveDng(contentResolver, ShotSaver.DIR_DNG, name, shot)
+        }
+        Log.i(TAG, "saved $saved pipeline ${ms}ms ${ShotSaver.summary(shot.result)}")
+        return "${shot.lens.label}  ${ShotSaver.summary(shot.result)}  ${ms} мс"
+    }
+
+    private val prefs by lazy { getSharedPreferences("rawzero", MODE_PRIVATE) }
+
+    private fun toggle(label: String, key: String, default: Boolean) = Button(this).apply {
+        isAllCaps = false
+        fun refresh() {
+            val on = prefs.getBoolean(key, default)
+            text = label
+            alpha = if (on) 1f else 0.4f
+        }
+        refresh()
+        setOnClickListener {
+            prefs.edit().putBoolean(key, !prefs.getBoolean(key, default)).apply()
+            refresh()
         }
     }
 

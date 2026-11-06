@@ -35,6 +35,18 @@ pub fn unpack_raw12(src: &[u8], width: usize, height: usize, row_stride: usize) 
     RawImage::new(width, height, data)
 }
 
+/// `ImageFormat.RAW_SENSOR`: one little-endian u16 per pixel, rows `row_stride` bytes apart
+/// (`Image.Plane.getRowStride()`).
+pub fn unpack_raw16(src: &[u8], width: usize, height: usize, row_stride: usize) -> Result<RawImage, Error> {
+    check(src, width, height, row_stride, 1, 2)?;
+    let mut data = Vec::with_capacity(width * height);
+    for y in 0..height {
+        let row = &src[y * row_stride..y * row_stride + width * 2];
+        data.extend(row.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])));
+    }
+    RawImage::new(width, height, data)
+}
+
 fn check(src: &[u8], w: usize, h: usize, stride: usize, px: usize, bytes: usize) -> Result<(), Error> {
     let row_bytes = w / px * bytes;
     if w == 0 || h == 0 || w % px != 0 || stride < row_bytes || src.len() < (h - 1) * stride + row_bytes {
@@ -63,6 +75,13 @@ mod tests {
         // 0xABC, 0x123 -> AB 12 3C
         let img = unpack_raw12(&[0xAB, 0x12, 0x3C, 0xAB, 0x12, 0x3C], 2, 2, 3).unwrap();
         assert_eq!(img.data, vec![0xABC, 0x123, 0xABC, 0x123]);
+    }
+
+    #[test]
+    fn raw16_with_stride() {
+        let src = [0x34, 0x12, 0xFF, 0x03, 0xAA, 0xAA, 0x01, 0x00, 0x02, 0x00];
+        let img = unpack_raw16(&src, 2, 2, 6).unwrap();
+        assert_eq!(img.data, vec![0x1234, 0x03FF, 0x0001, 0x0002]);
     }
 
     #[test]

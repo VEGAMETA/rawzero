@@ -14,35 +14,39 @@ import java.util.Date
 import java.util.Locale
 
 /**
- * Writes a shot as a pair with one base name into Pictures/RawZero/dev/:
- * `<time>_<lens>.dng` (DngCreator) and `<time>_<lens>_isp.jpg` (ISP output of the same request).
+ * Gallery layout:
+ *   Pictures/RawZero/<name>.jpg          our pipeline, the photo
+ *   Pictures/RawZero/DNG/<name>.dng      optional RAW
+ *   Pictures/RawZero/dev/<name>.dng + <name>_isp.jpg   look-development pairs (dev toggle)
  */
 object ShotSaver {
-    const val DIR = "Pictures/RawZero/dev"
+    const val DIR = "Pictures/RawZero"
+    const val DIR_DNG = "Pictures/RawZero/DNG"
+    const val DIR_DEV = "Pictures/RawZero/dev"
 
-    fun save(cr: ContentResolver, shot: Shot): List<String> {
-        val base = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date()) + "_cam" + shot.lens.id
-        val dng = "$base.dng"
-        val jpg = "${base}_isp.jpg"
-        write(cr, dng, "image/x-adobe-dng") { out ->
+    fun baseName(shot: Shot): String =
+        "RZ_" + SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date()) + "_cam" + shot.lens.id
+
+    fun saveJpeg(cr: ContentResolver, dir: String, name: String, bytes: ByteArray) =
+        write(cr, dir, "$name.jpg", "image/jpeg") { it.write(bytes) }
+
+    fun saveDng(cr: ContentResolver, dir: String, name: String, shot: Shot) =
+        write(cr, dir, "$name.dng", "image/x-adobe-dng") { out ->
             DngCreator(shot.lens.chars, shot.result).use { d ->
                 d.setOrientation(exifOrientation(shot.jpegOrientation))
                 d.writeImage(out, shot.raw)
             }
         }
-        write(cr, jpg, "image/jpeg") { it.write(shot.ispJpeg) }
-        return listOf(dng, jpg)
-    }
 
-    private fun write(cr: ContentResolver, name: String, mime: String, body: (OutputStream) -> Unit) {
+    private fun write(cr: ContentResolver, dir: String, file: String, mime: String, body: (OutputStream) -> Unit): String {
         val values = ContentValues().apply {
-            put(MediaStore.MediaColumns.DISPLAY_NAME, name)
+            put(MediaStore.MediaColumns.DISPLAY_NAME, file)
             put(MediaStore.MediaColumns.MIME_TYPE, mime)
-            put(MediaStore.MediaColumns.RELATIVE_PATH, DIR)
+            put(MediaStore.MediaColumns.RELATIVE_PATH, dir)
             put(MediaStore.MediaColumns.IS_PENDING, 1)
         }
         val uri: Uri = cr.insert(MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY), values)
-            ?: error("MediaStore insert failed for $name")
+            ?: error("MediaStore insert failed for $file")
         try {
             cr.openOutputStream(uri)!!.use(body)
             cr.update(uri, ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }, null, null)
@@ -50,6 +54,7 @@ object ShotSaver {
             cr.delete(uri, null, null)
             throw e
         }
+        return "$dir/$file"
     }
 
     fun exifOrientation(degrees: Int) = when ((degrees % 360 + 360) % 360) {
