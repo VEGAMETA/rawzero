@@ -28,6 +28,11 @@ object Native {
     fun referenceRgb(ispJpeg: ByteArray): Triple<ByteArray, Int, Int>? {
         val bmp = android.graphics.BitmapFactory.decodeByteArray(ispJpeg, 0, ispJpeg.size,
             android.graphics.BitmapFactory.Options().apply { inSampleSize = 4 }) ?: return null
+        return referenceRgb(bmp).also { bmp.recycle() }
+    }
+
+    /** Any ISP-rendered bitmap (e.g. the preview frame at the shutter) as RGB8. */
+    fun referenceRgb(bmp: android.graphics.Bitmap): Triple<ByteArray, Int, Int> {
         val px = IntArray(bmp.width * bmp.height)
         bmp.getPixels(px, 0, bmp.width, 0, 0, bmp.width, bmp.height)
         val rgb = ByteArray(px.size * 3)
@@ -37,7 +42,7 @@ object Native {
             rgb[3 * i + 1] = (c shr 8).toByte()
             rgb[3 * i + 2] = c.toByte()
         }
-        return Triple(rgb, bmp.width, bmp.height).also { bmp.recycle() }
+        return Triple(rgb, bmp.width, bmp.height)
     }
 
     @JvmStatic

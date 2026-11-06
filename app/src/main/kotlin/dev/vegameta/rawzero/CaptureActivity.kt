@@ -87,6 +87,8 @@ class CaptureActivity : Activity(), SurfaceHolder.Callback {
     private lateinit var ring: dev.vegameta.rawzero.ui.ProgressRing
     private lateinit var countdown: TextView
     private var exposureAnim: android.animation.ValueAnimator? = null
+    /** Preview frame grabbed at the shutter: look reference when the lens has no ISP JPEG. */
+    @Volatile private var shutterFrame: Bitmap? = null
     private lateinit var orientation: OrientationEventListener
 
     private var lenses: List<Lens> = emptyList()
@@ -277,6 +279,11 @@ class CaptureActivity : Activity(), SurfaceHolder.Callback {
             setOnClickListener { prefs.edit().putBoolean(PREF_DEV, !prefs.getBoolean(PREF_DEV, true)).apply(); refresh() }
         }, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { leftMargin = dp(12) })
         panel.addView(bottom)
+        panel.addView(Button(this).apply {
+            text = "Пересканировать камеры"
+            isAllCaps = false
+            setOnClickListener { panel.visibility = View.GONE; discover(rescan = true) }
+        })
     }
 
     private fun update(c: Controls) {
@@ -288,10 +295,20 @@ class CaptureActivity : Activity(), SurfaceHolder.Callback {
 
     // ---------------------------------------------------------------- camera
 
-    private fun discover() {
+    /**
+     * Lenses from the per-build cache, or a full scan (first launch, OS update, or [rescan]):
+     * every candidate is opened and configured once, which takes a few seconds.
+     */
+    private fun discover(rescan: Boolean = false) {
         scope.launch {
-            lenses = withContext(Dispatchers.Default) { CameraCatalog.discover(cm) }
-            Log.i(TAG, "lenses: " + lenses.joinToString { "${it.label}=${it.id}${if (it.listed) "" else "(hidden)"}" })
+            closeCamera()
+            val cached = if (rescan) null else withContext(Dispatchers.Default) { CameraCatalog.cached(this@CaptureActivity, cm) }
+            lenses = cached ?: cameraLock.withLock {
+                CameraCatalog.scan(this@CaptureActivity, cm) { done, total ->
+                    withContext(Dispatchers.Main) { status.text = "ищу камеры… $done из $total" }
+                }
+            }
+            Log.i(TAG, "lenses: " + lenses.joinToString { "${it.label}=${it.key}${if (it.listed) "" else "(hidden)"}" })
             lensBar.removeAllViews()
             for (l in lenses) {
                 lensBar.addView(Button(this@CaptureActivity).apply {
@@ -304,8 +321,8 @@ class CaptureActivity : Activity(), SurfaceHolder.Callback {
                 }, LinearLayout.LayoutParams(WRAP_CONTENT, dp(36)).apply { leftMargin = dp(4); rightMargin = dp(4) })
             }
             // `adb shell am start ... --es lens <id>` preselects a lens (testing).
-            val wanted = intent.getStringExtra("lens")?.let { id -> lenses.firstOrNull { it.id == id } }
-            if (lenses.isEmpty()) status.text = "RAW-камер не найдено"
+            val wanted = intent.getStringExtra("lens")?.let { id -> lenses.firstOrNull { it.id == id || it.key == id } }
+            if (lenses.isEmpty()) status.text = "камер не найдено"
             else select(wanted ?: lenses.firstOrNull { !it.front && it.eqMm in 20..30 } ?: lenses.first())
             // Test presets after the lens is chosen: --el exp <ns> --ei iso <n> --ei kelvin <K> --ei ev <steps>.
             if (intent.hasExtra("exp") || intent.hasExtra("iso") || intent.hasExtra("kelvin") || intent.hasExtra("ev")) {
@@ -348,9 +365,11 @@ class CaptureActivity : Activity(), SurfaceHolder.Callback {
                     session = CaptureSession.open(cm, lens, surface.holder.surface, controls)
                     status.text = lens.label
                     Log.i(TAG, "opened ${lens.id}")
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    throw e // superseded by a newer reopen (lens switch), not an error
                 } catch (e: Throwable) {
-                    Log.e(TAG, "open ${lens.id}", e)
-                    status.text = "ошибка камеры ${lens.id}: ${e.message}"
+                    Log.e(TAG, "open ${lens.key}", e)
+                    status.text = "ошибка камеры ${lens.label}: ${e.message}"
                 }
             }
         }
@@ -432,18 +451,31 @@ class CaptureActivity : Activity(), SurfaceHolder.Callback {
     /** Our pipeline -> gallery JPEG; RAW mode adds the DNG; dev pairs keep DNG + ISP JPEG. */
     private fun process(shot: Shot, m: Mode): Triple<String, Uri, Bitmap?> {
         val name = ShotSaver.baseName(shot)
+        val raw = shot.raw
+        if (raw == null) {
+            // ISP-only lens (no RAW in the HAL): keep the phone's own JPEG rather than nothing.
+            val jpeg = requireNotNull(shot.ispJpeg) { "lens ${shot.lens.key} delivered nothing" }
+            val uri = ShotSaver.saveJpeg(contentResolver, ShotSaver.DIR, name, jpeg)
+            Log.i(TAG, "saved $name ISP-only ${ShotSaver.summary(shot.result)}")
+            return Triple("${shot.lens.label}  ${ShotSaver.summary(shot.result)}  без RAW", uri, thumbnail(jpeg, shot.jpegOrientation))
+        }
         val t0 = System.nanoTime()
         // Front camera keeps the mirror the preview showed (owner decision).
         val mirror = if (shot.lens.front) shot.jpegOrientation else null
-        // Classic / Night: tone matched to what the ISP (preview) showed; RAW mode: Process Zero.
-        val reference = if (m == Mode.RAW) null else Native.referenceRgb(shot.ispJpeg)
-        val jpeg = Native.process(shot.raw, shot.lens.chars, shot.result, ShotSaver.exifOrientation(shot.jpegOrientation), mirror, reference)
+        // Classic / Night: tone matched to what the user saw - the ISP JPEG of the same
+        // request, else the preview frame grabbed at the shutter. RAW mode: Process Zero.
+        val reference = when {
+            m == Mode.RAW -> null
+            shot.ispJpeg != null -> Native.referenceRgb(shot.ispJpeg)
+            else -> shutterFrame?.let(Native::referenceRgb)
+        }
+        val jpeg = Native.process(raw, shot.lens.chars, shot.result, ShotSaver.exifOrientation(shot.jpegOrientation), mirror, reference)
         val ms = (System.nanoTime() - t0) / 1_000_000
         val uri = ShotSaver.saveJpeg(contentResolver, ShotSaver.DIR, name, jpeg)
         if (m == Mode.RAW) ShotSaver.saveDng(contentResolver, ShotSaver.DIR_DNG, name, shot)
         if (prefs.getBoolean(PREF_DEV, true)) {
             ShotSaver.saveDng(contentResolver, ShotSaver.DIR_DEV, name, shot)
-            ShotSaver.saveJpeg(contentResolver, ShotSaver.DIR_DEV, name + "_isp", shot.ispJpeg)
+            shot.ispJpeg?.let { ShotSaver.saveJpeg(contentResolver, ShotSaver.DIR_DEV, name + "_isp", it) }
         }
         Log.i(TAG, "saved $name mode $m pipeline ${ms}ms ${ShotSaver.summary(shot.result)}")
         return Triple("${shot.lens.label}  ${ShotSaver.summary(shot.result)}  $ms мс", uri, thumbnail(jpeg, shot.jpegOrientation))
@@ -469,7 +501,10 @@ class CaptureActivity : Activity(), SurfaceHolder.Callback {
         if (surface.width == 0) return
         val bmp = Bitmap.createBitmap(surface.width / 3, surface.height / 3, Bitmap.Config.ARGB_8888)
         PixelCopy.request(surface, bmp, { result ->
-            if (result == PixelCopy.SUCCESS) flyToThumbnail(bmp)
+            if (result == PixelCopy.SUCCESS) {
+                shutterFrame = bmp
+                flyToThumbnail(bmp)
+            }
         }, Handler(Looper.getMainLooper()))
     }
 

@@ -30,13 +30,17 @@ object ShotSaver {
     fun saveJpeg(cr: ContentResolver, dir: String, name: String, bytes: ByteArray) =
         write(cr, dir, "$name.jpg", "image/jpeg") { it.write(bytes) }
 
-    fun saveDng(cr: ContentResolver, dir: String, name: String, shot: Shot) =
-        write(cr, dir, "$name.dng", "image/x-adobe-dng") { out ->
-            DngCreator(shot.lens.chars, shot.result).use { d ->
+    fun saveDng(cr: ContentResolver, dir: String, name: String, shot: Shot): Uri {
+        val raw = requireNotNull(shot.raw) { "no RAW for ${shot.lens.key}" }
+        // A physical stream's result can lack keys DngCreator wants; the logical one has them.
+        val creator = runCatching { DngCreator(shot.lens.chars, shot.result) }.getOrElse { DngCreator(shot.lens.chars, shot.total) }
+        return write(cr, dir, "$name.dng", "image/x-adobe-dng") { out ->
+            creator.use { d ->
                 d.setOrientation(exifOrientation(shot.jpegOrientation))
-                d.writeImage(out, shot.raw)
+                d.writeImage(out, raw)
             }
         }
+    }
 
     private fun write(cr: ContentResolver, dir: String, file: String, mime: String, body: (OutputStream) -> Unit): Uri {
         val values = ContentValues().apply {
