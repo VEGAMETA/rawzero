@@ -1,0 +1,13 @@
+[package]
+name = "rawzero-desktop"
+description = "Runs the rawzero-core pipeline on DNG files"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "rawzero"
+path = "src/main.rs"
+
+[dependencies]
+rawzero-core = { path = "../core" }

@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = ["core", "desktop"]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+
+# Tests run the full pipeline on 12 MP buffers; unoptimized f32 loops are too slow.
+[profile.test]
+opt-level = 3

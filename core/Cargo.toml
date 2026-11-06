@@ -1,0 +1,9 @@
+[package]
+name = "rawzero-core"
+description = "Deterministic single-frame RAW pipeline: levels, shading, WB, demosaic, color, tone, encode"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+jpeg-encoder = "0.7.1"
