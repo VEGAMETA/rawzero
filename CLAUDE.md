@@ -27,7 +27,17 @@ Non-goals:
 | Xiaomi 14 (HyperOS 3, Android 16) | Open Camera (Camera2) sees only W and UW on the back; telephoto and front are hidden, presumably by the firmware allow-list (`vendor.camera.aux.packagelist`). 50 MP quad-Bayer sensor. Stock camera Pro-mode DNGs are **not** single frames: at ISO 3200 their shot-noise slope is ~120x below Open Camera's and the noise is spatially correlated (`tools/reports/raw_noise.md`). Open Camera RAW_SENSOR is clean: white noise, dynamic black level preserved with values below it. Its DNGs are lossless-JPEG compressed. |
 | Samsung S21 Ultra (One UI) | Open Camera sees only W and UW on the back; 3x/10x telephotos and front are hidden, `physicalCameraIds` is empty. HM3 sensor is nonacell (3×3). Stock Pro-mode DNGs (also from the 3x tele) have black level 0 with negatives clipped to 0, which biases shadows magenta; shading is pre-applied (identity 1x1 GainMap); main-camera noise is spatially correlated. |
 
-**Goal: every physical camera (all rear lenses and front) in RAW, single frame, no vendor processing.** Hidden cameras are not to be accepted as given; mechanisms under investigation: vendor package allow-lists (Xiaomi `vendor.camera.aux.packagelist`, Samsung allow-listed package names), probing camera IDs outside `getCameraIdList()`, logical-camera `CONTROL_ZOOM_RATIO` switching, root as last resort. Never hardcode IDs: discover them on device. Every lens obtained this way must pass `tools/raw_noise.py` (white noise, `a` consistent with ISO) before it counts as "RAW".
+**Goal: every physical camera in RAW, single frame, no vendor processing.** Probe results (`app/` probe, `tools/camera_dump.py`, `tools/reports/raw_noise_probe.md`), 2026-11-06:
+
+| | W | UW | Tele | Tele 2 | Front |
+|---|---|---|---|---|---|
+| S21U (One UI, Android 15) | 0 | 2 | 50 (9 mm, 3x) | 52 (30.6 mm, 10x) | 1/3/4: no RAW in HAL at all |
+| Xiaomi 14 (HyperOS 3, Android 16) | 2 (also logical 0) | 3 (also physical stream of logical 0) | 4 (9 mm) | — | 1 |
+
+- **Samsung:** cameraserver hides IDs 20/21/23/50/52/56/58 per package. Under the package names `com.samsung.android.scan3d` or `com.samsung.android.ruler` (app flavors `scan3d`, `ruler`) they are visible and 50/52 deliver RAW_SENSOR. Physical streams through logical 20/21/23 fail; use the direct IDs. RAW is 10-bit with black level 0 and negatives clipped to 0 by the HAL (shadow bias, unrecoverable). Noise is white (single frame).
+- **Xiaomi:** no allow-list for this; hidden IDs 2/3/4 answer `getCameraCharacteristics`/`openCamera` from any package, `getCameraIdList()` just omits them. Opening hidden logical ID 5 crashed the camera provider: never open hidden logical cameras. HAL reports `LENS_SHADING_APPLIED=true` but the RAW is not shading-corrected (noise test, visual check): the GainMap must be applied.
+- Discover IDs on device by probing 0..127; never hardcode. Every lens must pass `tools/raw_noise.py` (white noise, `a` consistent with ISO, `corner` ratio for pre-applied shading) before it counts as "RAW".
+- `adb install` on HyperOS needs "Install via USB" enabled; `-g` is rejected, grant CAMERA with `pm grant`.
 
 ## Architecture
 
@@ -49,6 +59,7 @@ tools/        Python (numpy): noise/sharpness analysis, ISP behavior checks
 - **Capture:** on shutter press, one `TEMPLATE_STILL_CAPTURE` request with `ImageFormat.RAW_SENSOR` output. If `RAW_SENSOR` is unavailable, try `RAW10`/`RAW12` and unpack. Do not use `RAW_PRIVATE`.
 - **Support check:** `REQUEST_AVAILABLE_CAPABILITIES` contains `..._RAW`, and the format is listed in `StreamConfigurationMap.getOutputFormats()`.
 - **3A** (AE/AF/AWB) stays automatic. Capture the full `CaptureResult` with the frame and pass its metadata to Rust.
+- **Camera IDs:** see Target devices; hidden IDs are reached by direct ID (Xiaomi) or allow-listed package name (Samsung).
 - **Resolution:** use the default binned RAW (~12 MP). Do not touch `ULTRA_HIGH_RESOLUTION_SENSOR` / `SENSOR_PIXEL_MODE_MAXIMUM_RESOLUTION`.
 
 ## Pipeline (core)

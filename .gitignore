@@ -3,3 +3,6 @@
 !desktop/testdata/**/*.jpg
 desktop/testdata/download/
 samples/
+.gradle/
+build/
+local.properties
