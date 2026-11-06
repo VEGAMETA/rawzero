@@ -40,6 +40,8 @@ class Shot(
     val result: CaptureResult,
     val total: TotalCaptureResult,
     val jpegOrientation: Int,
+    /** Zoom of the request (the RAW must be cropped to match the ISP outputs). */
+    val zoom: Float = 1f,
     private val onClose: () -> Unit = {},
 ) : AutoCloseable {
     override fun close() {
@@ -171,7 +173,22 @@ class CaptureSession private constructor(
     }
 
     /** One still request writing RAW and/or the ISP JPEG. */
+    /**
+     * Flash "on capture": torch on in the preview for a moment so AE/AWB settle under it,
+     * then the still (also with torch), then the normal preview again (re-armed in shoot()).
+     */
+    private suspend fun preLight() {
+        if (controls.flash != Flash.CAPTURE || !hasFlash(lens.chars)) return
+        val req = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
+            addTarget(preview)
+            applyControls(lens, controls, lastAutoAe, lastAutoAwb, preview = false)
+        }.build()
+        session.setRepeatingRequest(req, previewCallback, handler)
+        kotlinx.coroutines.delay(if (controls.exposureManual) 250 else 700)
+    }
+
     suspend fun shoot(jpegOrientation: Int): Shot {
+        preLight()
         rawReader?.let(::drain)
         jpegReader?.let(::drain)
         val rawImage = CompletableDeferred<Image>()
@@ -199,9 +216,10 @@ class CaptureSession private constructor(
             // A physical stream's metadata (black level, WB, shading map) is in its own result.
             val result: CaptureResult = lens.physicalId?.let { total.physicalCameraTotalResults[it] } ?: total
             Log.i("RawZero", "capture took ${(System.nanoTime() - t0) / 1_000_000} ms, " +
-                "result exp ${result.get(CaptureResult.SENSOR_EXPOSURE_TIME)} iso ${result.get(CaptureResult.SENSOR_SENSITIVITY)}")
+                "result exp ${result.get(CaptureResult.SENSOR_EXPOSURE_TIME)} iso ${result.get(CaptureResult.SENSOR_SENSITIVITY)} flash ${result.get(CaptureResult.FLASH_STATE)}")
             synchronized(lock) { inFlight++ }
-            val shot = Shot(lens, rawReader?.let { rawImage.await() }, jpegReader?.let { jpegBytes.await() }, result, total, jpegOrientation) {
+            val zoom = controls.zoom.coerceIn(1f, zoomRange(lens.chars).first)
+            val shot = Shot(lens, rawReader?.let { rawImage.await() }, jpegReader?.let { jpegBytes.await() }, result, total, jpegOrientation, zoom) {
                 synchronized(lock) {
                     inFlight--
                     if (closed && inFlight == 0) closeReaders()
@@ -222,6 +240,7 @@ class CaptureSession private constructor(
      */
     suspend fun shootNight(frames: Int, jpegOrientation: Int, onFrame: suspend (Int, Image, CaptureResult?) -> Unit) {
         val reader = rawReader ?: error("night mode needs RAW")
+        preLight()
         drain(reader)
         val ae = lastAutoAe
         val ch = lens.chars

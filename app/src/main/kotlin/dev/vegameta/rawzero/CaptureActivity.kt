@@ -59,6 +59,8 @@ import kotlinx.coroutines.withContext
 private const val TAG = "RawZero"
 private const val PREF_MODE = "mode"
 private const val PREF_DEV = "save_dev_pairs"
+private const val PREF_LENS = "lens"
+private const val PREF_FLASH = "flash"
 /// Exposures from this length on get the ring + countdown indicator.
 private const val LONG_EXPOSURE_UI_NS = 500_000_000L
 
@@ -67,7 +69,7 @@ private const val LONG_EXPOSURE_UI_NS = 500_000_000L
  * raw noise reduction and tone/WB matched to the preview. RAW: Process Zero + DNG.
  * SCREEN: exactly what the screen showed - the ISP's own JPEG of the shot.
  */
-enum class Mode(val title: String) { NIGHT("Ночь"), CLASSIC("Классика"), RAW("RAW"), SCREEN("Экран") }
+enum class Mode(val title: String) { NIGHT("Ночь"), CLASSIC("Цифровой"), RAW("RAW"), SCREEN("Экран") }
 
 /**
  * Camera screen: ISP preview, lens bar, modes, manual controls (all auto by default),
@@ -92,6 +94,11 @@ class CaptureActivity : Activity(), SurfaceHolder.Callback {
     private lateinit var ring: dev.vegameta.rawzero.ui.ProgressRing
     private lateinit var countdown: TextView
     private var exposureAnim: android.animation.ValueAnimator? = null
+    private lateinit var zoomLabel: TextView
+    private lateinit var flashButton: TextView
+    private var flashMode: dev.vegameta.rawzero.camera.Flash
+        get() = runCatching { dev.vegameta.rawzero.camera.Flash.valueOf(prefs.getString(PREF_FLASH, "OFF")!!) }.getOrDefault(dev.vegameta.rawzero.camera.Flash.OFF)
+        set(v) = prefs.edit().putString(PREF_FLASH, v.name).apply()
     /** Preview frame grabbed at the shutter: look reference when the lens has no ISP JPEG. */
     @Volatile private var shutterFrame: Bitmap? = null
     private lateinit var orientation: OrientationEventListener
@@ -164,6 +171,28 @@ class CaptureActivity : Activity(), SurfaceHolder.Callback {
             visibility = View.GONE
         }
         previewBox.addView(countdown, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
+        zoomLabel = TextView(this).apply {
+            setTextColor(Color.WHITE)
+            textSize = 13f
+            setPadding(dp(10), dp(4), dp(10), dp(4))
+            background = GradientDrawable().apply { cornerRadius = dp(14).toFloat(); setColor(Color.argb(110, 0, 0, 0)) }
+            setOnClickListener { setZoom(1f) }
+        }
+        previewBox.addView(zoomLabel, FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT, Gravity.TOP or Gravity.CENTER_HORIZONTAL).apply { topMargin = dp(12) })
+        flashButton = TextView(this).apply {
+            setTextColor(Color.WHITE)
+            textSize = 13f
+            setPadding(dp(12), dp(6), dp(12), dp(6))
+            background = GradientDrawable().apply { cornerRadius = dp(16).toFloat(); setColor(Color.argb(110, 0, 0, 0)) }
+            setOnClickListener {
+                val all = dev.vegameta.rawzero.camera.Flash.entries
+                flashMode = all[(flashMode.ordinal + 1) % all.size]
+                refreshFlash()
+                update(controls.copy(flash = flashMode))
+            }
+        }
+        previewBox.addView(flashButton, FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT, Gravity.TOP or Gravity.START).apply { topMargin = dp(10); leftMargin = dp(10) })
+        installZoomGestures()
         column.addView(previewBox, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
 
         column.addView(View(this), LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
@@ -279,7 +308,7 @@ class CaptureActivity : Activity(), SurfaceHolder.Callback {
         bottom.addView(Button(this).apply {
             text = "Всё авто"
             isAllCaps = false
-            setOnClickListener { update(Controls()); buildPanel(lens) }
+            setOnClickListener { update(Controls(zoom = controls.zoom, flash = flashMode)); buildPanel(lens) }
         })
         bottom.addView(Button(this).apply {
             isAllCaps = false
@@ -295,9 +324,49 @@ class CaptureActivity : Activity(), SurfaceHolder.Callback {
         })
     }
 
+    private fun refreshFlash() {
+        flashButton.text = when (flashMode) {
+            dev.vegameta.rawzero.camera.Flash.OFF -> "⚡ выкл"
+            dev.vegameta.rawzero.camera.Flash.CAPTURE -> "⚡ при съёмке"
+            dev.vegameta.rawzero.camera.Flash.ALWAYS -> "⚡ всегда"
+        }
+        flashButton.alpha = if (flashMode == dev.vegameta.rawzero.camera.Flash.OFF) 0.6f else 1f
+        flashButton.visibility = if (current?.let { dev.vegameta.rawzero.camera.hasFlash(it.chars) } == true) View.VISIBLE else View.GONE
+    }
+
+    private fun maxZoom(): Float = current?.let { dev.vegameta.rawzero.camera.zoomRange(it.chars).first } ?: 1f
+
+    private fun setZoom(z: Float) {
+        val zz = z.coerceIn(1f, maxZoom())
+        zoomLabel.text = if (zz < 9.95f) "%.1f×".format(zz) else "%.0f×".format(zz)
+        if (zz != controls.zoom) update(controls.copy(zoom = zz))
+    }
+
+    /** Pinch to zoom on the preview, double tap toggles 1x / 2x. */
+    @android.annotation.SuppressLint("ClickableViewAccessibility")
+    private fun installZoomGestures() {
+        val scale = android.view.ScaleGestureDetector(this, object : android.view.ScaleGestureDetector.SimpleOnScaleGestureListener() {
+            override fun onScale(d: android.view.ScaleGestureDetector): Boolean {
+                setZoom(controls.zoom * d.scaleFactor)
+                return true
+            }
+        })
+        val taps = android.view.GestureDetector(this, object : android.view.GestureDetector.SimpleOnGestureListener() {
+            override fun onDoubleTap(e: android.view.MotionEvent): Boolean {
+                setZoom(if (controls.zoom > 1.01f) 1f else 2f)
+                return true
+            }
+        })
+        surface.setOnTouchListener { _, ev ->
+            scale.onTouchEvent(ev)
+            taps.onTouchEvent(ev)
+            true
+        }
+    }
+
     private fun update(c: Controls) {
         controls = c
-        gear.text = if (c == Controls()) "AUTO" else "M"
+        gear.text = if (c.copy(zoom = 1f, flash = dev.vegameta.rawzero.camera.Flash.OFF) == Controls()) "AUTO" else "M"
         val s = session ?: return
         runCatching { s.setControls(c) }.onFailure { Log.e(TAG, "controls", it) }
     }
@@ -330,13 +399,18 @@ class CaptureActivity : Activity(), SurfaceHolder.Callback {
                 }, LinearLayout.LayoutParams(WRAP_CONTENT, dp(36)).apply { leftMargin = dp(4); rightMargin = dp(4) })
             }
             // `adb shell am start ... --es lens <id>` preselects a lens (testing).
-            val wanted = intent.getStringExtra("lens")?.let { id -> lenses.firstOrNull { it.id == id || it.key == id } }
+            // The lens from an adb test extra, else the one used last time.
+            val wantedKey = intent.getStringExtra("lens") ?: prefs.getString(PREF_LENS, null)
+            val wanted = wantedKey?.let { id -> lenses.firstOrNull { it.id == id || it.key == id } }
             if (android.os.Build.MANUFACTURER.equals("samsung", ignoreCase = true) && packageName == "dev.vegameta.rawzero") {
                 // Samsung shows its telephotos only to allow-listed package names.
                 status.text = "на Samsung установите «RawZero S», чтобы открылись телевики"
             }
             if (lenses.isEmpty()) status.text = "камер не найдено"
             else select(wanted ?: lenses.firstOrNull { !it.front && it.eqMm in 20..30 } ?: lenses.first())
+            // Test presets: --ef zoom <x> --es flash OFF|CAPTURE|ALWAYS
+            intent.getStringExtra("flash")?.let { runCatching { flashMode = dev.vegameta.rawzero.camera.Flash.valueOf(it); refreshFlash(); update(controls.copy(flash = flashMode)) } }
+            if (intent.hasExtra("zoom")) setZoom(intent.getFloatExtra("zoom", 1f))
             // Test presets after the lens is chosen: --el exp <ns> --ei iso <n> --ei kelvin <K> --ei ev <steps>.
             if (intent.hasExtra("exp") || intent.hasExtra("iso") || intent.hasExtra("kelvin") || intent.hasExtra("ev")) {
                 update(Controls(
@@ -356,7 +430,10 @@ class CaptureActivity : Activity(), SurfaceHolder.Callback {
             lensBar.getChildAt(i).alpha = if (lenses[i] == lens) 1f else 0.45f
         }
         // Lens ranges differ: keep only exposure compensation across a lens switch.
-        update(Controls(evSteps = controls.evSteps))
+        prefs.edit().putString(PREF_LENS, lens.key).apply()
+        update(Controls(evSteps = controls.evSteps, flash = flashMode))
+        setZoom(1f)
+        refreshFlash()
         buildPanel(lens)
         // Portrait UI: the 4:3 landscape sensor frame shows as 3:4.
         val size = CaptureSession.previewSize(lens)
@@ -476,7 +553,8 @@ class CaptureActivity : Activity(), SurfaceHolder.Callback {
             s.shootNight(dev.vegameta.rawzero.camera.NIGHT_FRAMES, orientation) { k, img, res ->
                 withContext(Dispatchers.Default) {
                     if (k == 0) {
-                        burst = Native.NightBurst(img, s.lens.chars, res!!, ShotSaver.exifOrientation(orientation), mirror, sensorRot, s.lens.front)
+                        burst = Native.NightBurst(img, s.lens.chars, res!!, ShotSaver.exifOrientation(orientation), mirror, sensorRot, s.lens.front,
+                            s.controls.zoom.coerceIn(1f, dev.vegameta.rawzero.camera.zoomRange(s.lens.chars).first))
                     } else {
                         burst!!.add(img)
                     }
@@ -537,7 +615,8 @@ class CaptureActivity : Activity(), SurfaceHolder.Callback {
         val previewRef = preview != null && m != Mode.RAW
         val sensorRot = shot.lens.chars[android.hardware.camera2.CameraCharacteristics.SENSOR_ORIENTATION] ?: 0
         val jpeg = Native.process(raw, shot.lens.chars, shot.result, ShotSaver.exifOrientation(shot.jpegOrientation), mirror, reference,
-            classic = m != Mode.RAW, refRotateCw = if (previewRef) sensorRot else 0, refMirror = previewRef && shot.lens.front)
+            classic = m != Mode.RAW, refRotateCw = if (previewRef) sensorRot else 0, refMirror = previewRef && shot.lens.front,
+            zoom = shot.zoom)
         val ms = (System.nanoTime() - t0) / 1_000_000
         val uri = ShotSaver.saveJpeg(contentResolver, ShotSaver.DIR, name, jpeg)
         if (m == Mode.RAW) ShotSaver.saveDng(contentResolver, ShotSaver.DIR_DNG, name, shot)

@@ -94,8 +94,8 @@ object Native {
      */
     fun process(raw: Image, ch: CameraCharacteristics, r: CaptureResult, exifOrientation: Int,
                 mirrorDegrees: Int? = null, reference: Triple<ByteArray, Int, Int>? = null,
-                classic: Boolean = false, refRotateCw: Int = 0, refMirror: Boolean = false, quality: Int = 92): ByteArray {
-        val a = arrays(raw, ch, r, exifOrientation, mirrorDegrees, classic, refRotateCw, refMirror, quality)
+                classic: Boolean = false, refRotateCw: Int = 0, refMirror: Boolean = false, quality: Int = 92, zoom: Float = 1f): ByteArray {
+        val a = arrays(raw, ch, r, exifOrientation, mirrorDegrees, classic, refRotateCw, refMirror, quality, zoom)
         val plane = raw.planes[0]
         return processRaw16(plane.buffer, raw.width, raw.height, plane.rowStride, a.ints, a.floats, a.doubles, a.shading, Build.MANUFACTURER,
             reference?.first, reference?.second ?: 0, reference?.third ?: 0)
@@ -113,11 +113,11 @@ object Native {
      * live in native memory.
      */
     class NightBurst(first: Image, ch: CameraCharacteristics, r: CaptureResult, exifOrientation: Int,
-                     mirrorDegrees: Int?, refRotateCw: Int, refMirror: Boolean) : AutoCloseable {
+                     mirrorDegrees: Int?, refRotateCw: Int, refMirror: Boolean, zoom: Float = 1f) : AutoCloseable {
         private var handle: Long
 
         init {
-            val a = arrays(first, ch, r, exifOrientation, mirrorDegrees, true, refRotateCw, refMirror, 92)
+            val a = arrays(first, ch, r, exifOrientation, mirrorDegrees, true, refRotateCw, refMirror, 92, zoom)
             val p = first.planes[0]
             handle = nightBegin(p.buffer, first.width, first.height, p.rowStride, a.ints, a.floats, a.doubles, a.shading, Build.MANUFACTURER)
         }
@@ -143,7 +143,7 @@ object Native {
 
     /** FrameMeta as flat arrays (layout in jni-bridge/src/lib.rs). */
     private fun arrays(raw: Image, ch: CameraCharacteristics, r: CaptureResult, exifOrientation: Int, mirrorDegrees: Int?,
-                       classic: Boolean, refRotateCw: Int, refMirror: Boolean, quality: Int): Arrays {
+                       classic: Boolean, refRotateCw: Int, refMirror: Boolean, quality: Int, zoom: Float = 1f): Arrays {
         require(raw.format == ImageFormat.RAW_SENSOR) { "format ${raw.format}" }
         val ints = IntArray(INTS_LEN)
         ints[CFA] = ch[CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT] ?: error("no CFA arrangement")
@@ -173,13 +173,22 @@ object Native {
             }
         }
 
-        // Crop to the pre-correction active array when the RAW covers the full pixel array.
+        // Crop to the pre-correction active array when the RAW covers the full pixel array,
+        // then to the zoomed center (RAW streams are never cropped by CONTROL_ZOOM_RATIO).
         val pixelArray = ch[CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE]
         val active = ch[CameraCharacteristics.SENSOR_INFO_PRE_CORRECTION_ACTIVE_ARRAY_SIZE]
+        var cx = 0; var cy = 0; var cw = raw.width; var chh = raw.height
         if (pixelArray != null && active != null && raw.width == pixelArray.width && raw.height == pixelArray.height &&
             (active.width() < raw.width || active.height() < raw.height)) {
-            ints[CROP_X] = active.left; ints[CROP_Y] = active.top
-            ints[CROP_W] = active.width(); ints[CROP_H] = active.height()
+            cx = active.left; cy = active.top; cw = active.width(); chh = active.height()
+        }
+        if (zoom > 1.001f) {
+            val w = (cw / zoom).toInt() and 1.inv()
+            val h = (chh / zoom).toInt() and 1.inv()
+            cx += ((cw - w) / 2) and 1.inv(); cy += ((chh - h) / 2) and 1.inv(); cw = w; chh = h
+        }
+        if (cw < raw.width || chh < raw.height) {
+            ints[CROP_X] = cx; ints[CROP_Y] = cy; ints[CROP_W] = cw; ints[CROP_H] = chh
         }
 
         val floats = FloatArray(9)

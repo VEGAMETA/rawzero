@@ -18,9 +18,23 @@ data class Controls(
     /** Diopters (1 / meters); 0 = infinity. */
     val focusDiopters: Float? = null,
     val kelvin: Int? = null,
+    /** Center zoom (1 = full frame). Preview/ISP via CONTROL_ZOOM_RATIO; RAW is cropped by us. */
+    val zoom: Float = 1f,
+    val flash: Flash = Flash.OFF,
 ) {
     val exposureManual get() = exposureNs != null || iso != null
 }
+
+/** OFF; CAPTURE: torch only around the still (AE meters with it); ALWAYS: torch on. */
+enum class Flash { OFF, CAPTURE, ALWAYS }
+
+/** Zoom limits of a lens: (max, uses CONTROL_ZOOM_RATIO). */
+fun zoomRange(ch: CameraCharacteristics): Pair<Float, Boolean> {
+    ch[CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE]?.let { return it.upper.coerceAtLeast(1f) to true }
+    return (ch[CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM] ?: 1f).coerceAtLeast(1f) to false
+}
+
+fun hasFlash(ch: CameraCharacteristics) = ch[CameraCharacteristics.FLASH_INFO_AVAILABLE] == true
 
 /** Longest exposure the preview runs at; longer manual exposures are simulated by ISO. */
 const val PREVIEW_MAX_EXPOSURE_NS = 33_333_333L
@@ -166,6 +180,26 @@ fun CaptureRequest.Builder.applyControls(
         set(CaptureRequest.LENS_FOCUS_DISTANCE, c.focusDiopters)
     } else if (CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE in af) {
         set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+    }
+
+    // Zoom: the ISP outputs (preview, JPEG) are cropped by the HAL; RAW is never cropped by
+    // Camera2, the pipeline crops it to the same center fraction (Native.arrays).
+    val (zmax, ratio) = zoomRange(ch)
+    val z = c.zoom.coerceIn(1f, zmax)
+    if (ratio) {
+        set(CaptureRequest.CONTROL_ZOOM_RATIO, z)
+    } else if (z > 1f) {
+        ch[CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE]?.let { a ->
+            val w = (a.width() / z).toInt()
+            val h = (a.height() / z).toInt()
+            val l = (a.width() - w) / 2
+            val t = (a.height() - h) / 2
+            set(CaptureRequest.SCALER_CROP_REGION, android.graphics.Rect(l, t, l + w, t + h))
+        }
+    }
+    if (hasFlash(ch)) {
+        val torch = c.flash == Flash.ALWAYS || (c.flash == Flash.CAPTURE && !preview)
+        set(CaptureRequest.FLASH_MODE, if (torch) CameraMetadata.FLASH_MODE_TORCH else CameraMetadata.FLASH_MODE_OFF)
     }
 
     if (c.kelvin != null) {
