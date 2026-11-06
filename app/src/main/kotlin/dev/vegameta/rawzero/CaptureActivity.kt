@@ -106,6 +106,8 @@ class CaptureActivity : Activity(), SurfaceHolder.Callback {
     private lateinit var orientation: OrientationEventListener
 
     private var lenses: List<Lens> = emptyList()
+    /** Test hook (--ez probe true): run the RAW probe on the first opened lens. */
+    private var forceProbe = false
     private var current: Lens? = null
     private var session: CaptureSession? = null
     private var controls = Controls()
@@ -135,6 +137,7 @@ class CaptureActivity : Activity(), SurfaceHolder.Callback {
         loadLastThumbnail()
         // Testing: `--es mode CLASSIC|NIGHT|RAW|SCREEN`.
         intent.getStringExtra("mode")?.let { runCatching { mode = Mode.valueOf(it); refreshModes() } }
+        forceProbe = intent.getBooleanExtra("probe", false)
         if (intent.hasExtra("dev")) prefs.edit().putBoolean(PREF_DEV, intent.getBooleanExtra("dev", false)).apply()
     }
 
@@ -587,6 +590,7 @@ class CaptureActivity : Activity(), SurfaceHolder.Callback {
                     }
                     status.text = lens.label
                     Log.i(TAG, "opened ${lens.id}")
+                    if (forceProbe && lens.raw) { forceProbe = false; scope.launch { probeRaw(lens, mode, "forced") } }
                 } catch (e: kotlinx.coroutines.CancellationException) {
                     throw e // superseded by a newer reopen (lens switch), not an error
                 } catch (e: Throwable) {
@@ -633,10 +637,10 @@ class CaptureActivity : Activity(), SurfaceHolder.Callback {
                 status.text = "ошибка съёмки: ${e.message} (отчёт в Download/RawZero)"
                 writeReport(s, m, e)
             } finally {
-                if (s.rawFailed && s.lens.raw) demoteToIsp(s.lens)
                 stopExposureIndicator()
                 busy = false
                 shutter.alpha = 1f
+                if (s.rawFailed && s.lens.raw) probeRaw(s.lens, m, s.trace)
             }
         }
     }
@@ -680,37 +684,80 @@ class CaptureActivity : Activity(), SurfaceHolder.Callback {
     }
 
     private fun writeReport(s: CaptureSession, m: Mode, e: Throwable) {
-        val l = s.lens
-        val ch = l.chars
         val text = buildString {
-            appendLine("RawZero error report")
-            appendLine("device: ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL} (${android.os.Build.DEVICE}), Android ${android.os.Build.VERSION.RELEASE} / SDK ${android.os.Build.VERSION.SDK_INT}")
-            appendLine("build: ${android.os.Build.FINGERPRINT}")
-            appendLine("hardware: ${android.os.Build.HARDWARE} soc ${runCatching { android.os.Build.SOC_MANUFACTURER + " " + android.os.Build.SOC_MODEL }.getOrNull()}")
-            appendLine("package: $packageName  mode: $m")
-            appendLine("lens: ${l.key} ${l.label} raw=${l.raw} ispJpeg=${l.ispJpeg} listed=${l.listed}")
-            appendLine("hw level: ${ch[android.hardware.camera2.CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL]}  caps: ${ch[android.hardware.camera2.CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES]?.joinToString()}")
-            appendLine("raw sizes: ${ch[android.hardware.camera2.CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP]?.let { m2 -> runCatching { m2.getOutputSizes(android.graphics.ImageFormat.RAW_SENSOR)?.joinToString() }.getOrNull() }}")
+            append(deviceInfo(s.lens, m))
             appendLine("controls: ${s.controls}")
             appendLine("trace: ${s.trace}")
-            appendLine("lenses: " + lenses.joinToString { "${it.label}=${it.key}${if (it.raw) "" else "(ISP)"}" })
             appendLine()
             appendLine(Log.getStackTraceString(e))
         }
         runCatching { ShotSaver.saveReport(contentResolver, text) }.onFailure { Log.e(TAG, "report", it) }
     }
 
+    private fun deviceInfo(l: Lens, m: Mode): String {
+        val ch = l.chars
+        return buildString {
+            appendLine("RawZero ${runCatching { packageManager.getPackageInfo(packageName, 0).versionName }.getOrNull()} report")
+            appendLine("device: ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL} (${android.os.Build.DEVICE}), Android ${android.os.Build.VERSION.RELEASE} / SDK ${android.os.Build.VERSION.SDK_INT}")
+            appendLine("build: ${android.os.Build.FINGERPRINT}")
+            appendLine("hardware: ${android.os.Build.HARDWARE} soc ${runCatching { android.os.Build.SOC_MANUFACTURER + " " + android.os.Build.SOC_MODEL }.getOrNull()}")
+            appendLine("package: $packageName  mode: $m")
+            appendLine("lens: ${l.key} ${l.label} raw=${l.raw} ispJpeg=${l.ispJpeg} listed=${l.listed} rawSize=${l.rawW}x${l.rawH} pv=${l.stillWithPreview} tpl=${l.previewTemplate}")
+            appendLine("hw level: ${ch[android.hardware.camera2.CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL]}  caps: ${ch[android.hardware.camera2.CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES]?.joinToString()}")
+            appendLine("raw sizes: ${ch[android.hardware.camera2.CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP]?.let { m2 -> runCatching { m2.getOutputSizes(android.graphics.ImageFormat.RAW_SENSOR)?.joinToString() }.getOrNull() }}")
+            appendLine("lenses: " + lenses.joinToString { "${it.label}=${it.key}${if (it.raw) "" else "(ISP)"}" })
+        }
+    }
+
+    /**
+     * The lens advertised RAW but the still brought none: close the camera, let [RawProbe]
+     * try other stream setups, keep the one that works (remembered), else go ISP-only.
+     * A report with every attempt goes to Download/RawZero either way.
+     */
+    private fun probeRaw(lens: Lens, m: Mode, trace: String) {
+        openJob?.cancel()
+        busy = true
+        shutter.alpha = 0.5f
+        status.text = "RAW не пришёл, подбираю режим камеры…"
+        scope.launch {
+            val log = StringBuilder()
+            val found = cameraLock.withLock {
+                session?.close()
+                session = null
+                dev.vegameta.rawzero.camera.RawProbe.find(cm, lens, log) { p -> runOnUiThread { status.text = p } }
+            }
+            val text = buildString {
+                append(deviceInfo(lens, m))
+                appendLine("first still: $trace")
+                appendLine("probe result: ${found?.let { "RAW ${it.rawW}x${it.rawH} jpegStream=${it.ispJpeg} previewInStill=${it.stillWithPreview} previewTemplate=${it.previewTemplate}" } ?: "no RAW in any setup"}")
+                appendLine()
+                append(log)
+            }
+            runCatching { withContext(Dispatchers.IO) { ShotSaver.saveReport(contentResolver, text) } }.onFailure { Log.e(TAG, "report", it) }
+            busy = false
+            shutter.alpha = 1f
+            if (found == null) { demoteToIsp(lens); return@launch }
+            dev.vegameta.rawzero.camera.CameraCatalog.store(this@CaptureActivity, found)
+            replaceLens(lens, found)
+            status.text = "${found.label}: RAW подобран, снимайте ещё раз"
+        }
+    }
+
+    private fun replaceLens(old: Lens, new: Lens) {
+        val i = lenses.indexOf(old)
+        if (i < 0) return
+        lenses = lenses.toMutableList().also { it[i] = new }
+        (lensBar.getChildAt(i) as? Button)?.apply { text = new.label; setOnClickListener { select(new) } }
+        select(new)
+    }
+
     /** RAW advertised but not delivered: use this lens as ISP-only from now on (and remember it). */
     private fun demoteToIsp(lens: Lens) {
         Log.w(TAG, "lens ${lens.key}: RAW not delivered, switching to ISP-only")
-        dev.vegameta.rawzero.camera.CameraCatalog.markIspOnly(this, lens)
-        val i = lenses.indexOf(lens)
-        if (i < 0) return
         val isp = lens.copy(raw = false, ispJpeg = true).also { it.label = lens.label + " ·ISP" }
-        lenses = lenses.toMutableList().also { it[i] = isp }
-        (lensBar.getChildAt(i) as? Button)?.apply { text = isp.label; setOnClickListener { select(isp) } }
-        status.text = "${isp.label}: RAW с этой камеры не приходит, снимаю JPEG камеры"
-        select(isp)
+        dev.vegameta.rawzero.camera.CameraCatalog.store(this, isp, probed = true)
+        replaceLens(lens, isp)
+        status.text = "${isp.label}: RAW с этой камеры не приходит, снимаю JPEG камеры (отчёт в Download/RawZero)"
     }
 
     /**

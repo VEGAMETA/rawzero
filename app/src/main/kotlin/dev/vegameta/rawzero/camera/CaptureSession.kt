@@ -112,7 +112,9 @@ class CaptureSession private constructor(
     companion object {
         private fun map(lens: Lens) = lens.chars[CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP]!!
 
-        fun rawSize(lens: Lens): Size = map(lens).getOutputSizes(ImageFormat.RAW_SENSOR).maxBy { it.width.toLong() * it.height }
+        fun rawSize(lens: Lens): Size =
+            if (lens.rawW > 0) Size(lens.rawW, lens.rawH)
+            else map(lens).getOutputSizes(ImageFormat.RAW_SENSOR).maxBy { it.width.toLong() * it.height }
 
         /** Sensor aspect from the active array (works for ISP-only lenses too). */
         private fun aspect(lens: Lens): Double {
@@ -234,8 +236,10 @@ class CaptureSession private constructor(
         }, handler)
         val lsmOn = lens.chars[CameraCharacteristics.STATISTICS_INFO_AVAILABLE_LENS_SHADING_MAP_MODES]
             ?.contains(CameraMetadata.STATISTICS_LENS_SHADING_MAP_MODE_ON) == true
-        fun still(withRaw: Boolean) = device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
+        fun still(withRaw: Boolean) = device.createCaptureRequest(
+            if (withRaw && lens.previewTemplate) CameraDevice.TEMPLATE_PREVIEW else CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
             if (withRaw) rawReader?.let { addTarget(it.surface) }
+            if (withRaw && lens.stillWithPreview) addTarget(preview)
             jpegReader?.let { addTarget(it.surface) }
             applyControls(lens, controls, lastAutoAe, lastAutoAwb, preview = false)
             if (lsmOn && withRaw) set(CaptureRequest.STATISTICS_LENS_SHADING_MAP_MODE, CameraMetadata.STATISTICS_LENS_SHADING_MAP_MODE_ON)
@@ -335,8 +339,9 @@ class CaptureSession private constructor(
         val focus = ae?.get(CaptureResult.LENS_FOCUS_DISTANCE)
         Log.i("RawZero", "burst: $frames x ${exp / 1_000_000} ms ISO $iso (metered ${meteredExp / 1_000_000} ms ISO $meteredIso)")
         val requests = (0 until frames).map {
-            device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
+            device.createCaptureRequest(if (lens.previewTemplate) CameraDevice.TEMPLATE_PREVIEW else CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
                 addTarget(reader.surface)
+                if (lens.stillWithPreview) addTarget(preview)
                 applyControls(lens, controls, lastAutoAe, lastAutoAwb, preview = false)
                 set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF)
                 set(CaptureRequest.SENSOR_EXPOSURE_TIME, exp)
@@ -346,7 +351,8 @@ class CaptureSession private constructor(
                     set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_OFF)
                     set(CaptureRequest.LENS_FOCUS_DISTANCE, focus)
                 }
-                set(CaptureRequest.STATISTICS_LENS_SHADING_MAP_MODE, CameraMetadata.STATISTICS_LENS_SHADING_MAP_MODE_ON)
+                if (ch[CameraCharacteristics.STATISTICS_INFO_AVAILABLE_LENS_SHADING_MAP_MODES]?.contains(CameraMetadata.STATISTICS_LENS_SHADING_MAP_MODE_ON) == true)
+                    set(CaptureRequest.STATISTICS_LENS_SHADING_MAP_MODE, CameraMetadata.STATISTICS_LENS_SHADING_MAP_MODE_ON)
             }.build()
         }
         // Back-pressure: the listener only signals; frames are acquired when the merge is ready

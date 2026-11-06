@@ -36,6 +36,13 @@ data class Lens(
     /** The ISP JPEG stream fits in the session next to RAW (look reference). */
     val ispJpeg: Boolean,
     val chars: CameraCharacteristics,
+    /** RAW stream size found by [RawProbe]; 0 = largest advertised. */
+    val rawW: Int = 0,
+    val rawH: Int = 0,
+    /** The HAL fills RAW only when the still request also targets the preview surface. */
+    val stillWithPreview: Boolean = false,
+    /** The HAL fills RAW only for TEMPLATE_PREVIEW requests. */
+    val previewTemplate: Boolean = false,
 ) {
     /** Sensor id for file names and logs. */
     val id: String get() = physicalId ?: cameraId
@@ -46,6 +53,8 @@ data class Lens(
 private const val TAG = "RawZero"
 private const val MAX_ID = 255
 private const val PREFS = "camera_catalog"
+/** Bumped when [RawProbe] learns new variants: lenses demoted by an older probe are retried. */
+private const val PROBE_VERSION = 1
 
 /**
  * Finds every usable lens on any phone:
@@ -81,19 +90,35 @@ object CameraCatalog {
         if (p.getString("fingerprint", null) != Build.FINGERPRINT) return null
         val spec = p.getString("lenses", null) ?: return null
         val all = candidates(cm).associateBy { it.key }
-        return spec.split(';').filter { it.isNotBlank() }.mapNotNull { e ->
-            val f = e.split('|')
-            all[f[0]]?.copy(raw = f.getOrNull(1) == "1", ispJpeg = f.getOrNull(2) == "1")
-        }.let(::finish).takeIf { it.isNotEmpty() }
+        return spec.split(';').filter { it.isNotBlank() }.mapNotNull { e -> decode(e, all) }
+            .let(::finish).takeIf { it.isNotEmpty() }
     }
 
-    /** Remembers that [lens] does not deliver RAW on this build (it was advertised but timed out). */
-    fun markIspOnly(ctx: Context, lens: Lens) {
+    /** Catalog entry: key|raw|ispJpeg|WxH|stillWithPreview|previewTemplate|probe marker. */
+    private fun encode(l: Lens, marker: String = "") =
+        "${l.key}|${b(l.raw)}|${b(l.ispJpeg)}|${l.rawW}x${l.rawH}|${b(l.stillWithPreview)}|${b(l.previewTemplate)}|$marker"
+
+    private fun b(v: Boolean) = if (v) "1" else "0"
+
+    private fun decode(e: String, all: Map<String, Lens>): Lens? {
+        val f = e.split('|')
+        val base = all[f[0]] ?: return null
+        var raw = f.getOrNull(1) == "1"
+        // A RAW-capable lens stored as ISP-only was demoted at runtime. Unless the current
+        // probe did that, give RAW another chance (the next failure runs the probe).
+        if (!raw && hasRaw(base.chars) && f.getOrNull(6) != "p$PROBE_VERSION") raw = true
+        val wh = f.getOrNull(3)?.split('x')?.mapNotNull { it.toIntOrNull() }
+        return base.copy(raw = raw, ispJpeg = f.getOrNull(2) == "1",
+            rawW = wh?.getOrNull(0) ?: 0, rawH = wh?.getOrNull(1) ?: 0,
+            stillWithPreview = f.getOrNull(4) == "1", previewTemplate = f.getOrNull(5) == "1")
+    }
+
+    /** Stores what was learned about [lens] at runtime; [probed] marks a demotion by the probe. */
+    fun store(ctx: Context, lens: Lens, probed: Boolean = false) {
         val p = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         val spec = p.getString("lenses", null) ?: return
         val updated = spec.split(';').filter { it.isNotBlank() }.joinToString(";") { e ->
-            val f = e.split('|')
-            if (f[0] == lens.key) "${f[0]}|0|1" else e
+            if (e.substringBefore('|') == lens.key) encode(lens, if (probed) "p$PROBE_VERSION" else "") else e
         }
         p.edit().putString("lenses", updated).apply()
     }
@@ -110,7 +135,7 @@ object CameraCatalog {
         val lenses = finish(dedupe(ok))
         ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
             .putString("fingerprint", Build.FINGERPRINT)
-            .putString("lenses", lenses.joinToString(";") { "${it.key}|${if (it.raw) 1 else 0}|${if (it.ispJpeg) 1 else 0}" })
+            .putString("lenses", lenses.joinToString(";") { encode(it) })
             .apply()
         Log.i(TAG, "scan: " + lenses.joinToString { "${it.label}=${it.key}${if (it.raw) "" else "(ISP)"}${if (it.ispJpeg) "" else "(noJPEG)"}" })
         return lenses
