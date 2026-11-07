@@ -120,8 +120,32 @@ class CaptureActivity : Activity(), SurfaceHolder.Callback {
         get() = runCatching { Mode.valueOf(prefs.getString(PREF_MODE, Mode.CLASSIC.name)!!) }.getOrDefault(Mode.CLASSIC)
         set(v) = prefs.edit().putString(PREF_MODE, v.name).apply()
 
+    /** Started over the lock screen: no gallery and no old photos until the user unlocks. */
+    private var overLock = false
+
+    /** Show over the keyguard only when started on a locked phone (tile, secure camera intent). */
+    private fun applyLockState() {
+        val km = getSystemService(android.app.KeyguardManager::class.java)
+        overLock = km.isKeyguardLocked
+        setShowWhenLocked(overLock)
+        setTurnScreenOn(overLock)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        val wasLocked = overLock
+        applyLockState()
+        if (overLock) {
+            // An instance from before the lock: hide its last photo.
+            lastPhoto = null
+            thumb.setImageDrawable(null)
+        } else if (wasLocked) loadLastThumbnail()
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        applyLockState()
         cm = getSystemService(CameraManager::class.java)
         buildUi()
         orientation = object : OrientationEventListener(this) {
@@ -1008,6 +1032,7 @@ class CaptureActivity : Activity(), SurfaceHolder.Callback {
     // ---------------------------------------------------------------- gallery
 
     private fun loadLastThumbnail() {
+        if (overLock) return // photos taken before the lock stay private
         scope.launch {
             val found = withContext(Dispatchers.IO) {
                 runCatching {
@@ -1020,6 +1045,14 @@ class CaptureActivity : Activity(), SurfaceHolder.Callback {
 
     private fun openGallery() {
         val uri = lastPhoto ?: return
+        val km = getSystemService(android.app.KeyguardManager::class.java)
+        if (km.isKeyguardLocked) {
+            // Over the lock screen the gallery waits for an unlock (like the stock camera).
+            km.requestDismissKeyguard(this, object : android.app.KeyguardManager.KeyguardDismissCallback() {
+                override fun onDismissSucceeded() { overLock = false; openGallery() }
+            })
+            return
+        }
         runCatching {
             startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(uri, "image/jpeg").addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION))
         }.onFailure { status.text = "нет приложения галереи" }

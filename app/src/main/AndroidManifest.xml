@@ -13,12 +13,30 @@
         <activity
             android:name=".CaptureActivity"
             android:exported="true"
+            android:launchMode="singleTask"
             android:screenOrientation="portrait">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+            <!-- "Open camera" from the system (lock screen gesture, other apps). -->
+            <intent-filter>
+                <action android:name="android.media.action.STILL_IMAGE_CAMERA" />
+                <action android:name="android.media.action.STILL_IMAGE_CAMERA_SECURE" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
         </activity>
+        <!-- Control Center / Quick Settings tile, reachable from the lock screen. -->
+        <service
+            android:name=".CameraTileService"
+            android:exported="true"
+            android:icon="@drawable/ic_tile"
+            android:label="${appLabel}"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+        </service>
         <!-- Diagnostics, started via adb (see ProbeActivity docs). -->
         <activity
             android:name=".probe.ProbeActivity"
