@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Name shown by vendor lock screen editors (HyperOS keyguard_shortcut_*). -->
+    <string name="lock_shortcut_name">RawZero</string>
+</resources>

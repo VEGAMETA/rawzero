@@ -146,6 +146,7 @@ class CaptureActivity : Activity(), SurfaceHolder.Callback {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         applyLockState()
+        runCatching { LockShortcut.refresh(this) }
         cm = getSystemService(CameraManager::class.java)
         buildUi()
         orientation = object : OrientationEventListener(this) {
@@ -366,6 +367,24 @@ class CaptureActivity : Activity(), SurfaceHolder.Callback {
             setOnClickListener { prefs.edit().putBoolean(PREF_DEV, !prefs.getBoolean(PREF_DEV, false)).apply(); refresh() }
         }, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { leftMargin = dp(12) })
         panel.addView(bottom)
+        if (LockShortcut.available(this)) panel.addView(Button(this).apply {
+            isAllCaps = false
+            fun refresh() { text = if (LockShortcut.isOurs(this@CaptureActivity)) "Кнопка камеры на блокировке: RawZero" else "Кнопка камеры на блокировке: стоковая" }
+            refresh()
+            setOnClickListener {
+                if (!LockShortcut.canWrite(this@CaptureActivity)) {
+                    val cmd = LockShortcut.grantCommand(this@CaptureActivity)
+                    getSystemService(android.content.ClipboardManager::class.java)
+                        .setPrimaryClip(android.content.ClipData.newPlainText("adb", cmd))
+                    status.text = "нужно разрешение, один раз с компьютера (скопировано): $cmd"
+                    return@setOnClickListener
+                }
+                runCatching {
+                    if (LockShortcut.isOurs(this@CaptureActivity)) LockShortcut.restore(this@CaptureActivity) else LockShortcut.install(this@CaptureActivity)
+                }.onFailure { status.text = "не вышло: ${it.message}" }
+                refresh()
+            }
+        })
         panel.addView(Button(this).apply {
             text = "Пересканировать камеры"
             isAllCaps = false
